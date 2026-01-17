@@ -20,6 +20,7 @@ APP_DIR="${APP_DIR:-/opt/decotv}"
 COMPOSE_FILE="${APP_DIR}/docker-compose.yml"
 STATE_DIR="${APP_DIR}/.state"
 DOMAINS_FILE="${STATE_DIR}/domains"
+ACME_ROOT="${ACME_ROOT:-/var/www/_acme}"
 NGINX_DIR_AVAILABLE="/etc/nginx/sites-available"
 NGINX_DIR_ENABLED="/etc/nginx/sites-enabled"
 INSTALL_CMD_PATH="/usr/local/bin/decotv"
@@ -75,6 +76,32 @@ install_pkg() {
       return 1
       ;;
   esac
+}
+
+
+ensure_basic_deps() {
+  # Minimal tools expected on a fresh VPS
+  local pkgs=()
+  has_cmd curl || pkgs+=("curl")
+  has_cmd tar  || pkgs+=("tar")
+  has_cmd ss   || pkgs+=("iproute2")
+  pkgs+=("ca-certificates")
+
+  local pm; pm="$(detect_pm)"
+  if [[ "$pm" == "apt" ]]; then
+    pkgs+=("gnupg" "lsb-release")
+  fi
+
+  # De-dup
+  local uniq=()
+  for p in "${pkgs[@]}"; do
+    [[ " ${uniq[*]} " == *" $p "* ]] || uniq+=("$p")
+  done
+
+  if [[ "${#uniq[@]}" -gt 0 ]]; then
+    log "检查依赖：将安装/补齐基础组件：${uniq[*]}"
+    install_pkg "${uniq[@]}" || true
+  fi
 }
 
 get_public_ipv4() {
@@ -139,34 +166,60 @@ list_recorded_domains() {
 }
 
 install_docker() {
+  ensure_basic_deps
   if has_cmd docker; then
     log "Docker 已安装"
     return 0
   fi
-  log "安装 Docker"
-  install_pkg ca-certificates curl gnupg lsb-release
-  if has_cmd apt-get; then
-    install_pkg docker.io
-  else
-    install_pkg docker
+
+  log "安装 Docker（纯净鸡兼容：优先包管理器，失败则使用官方脚本）"
+  local pm; pm="$(detect_pm)"
+  local ok=0
+
+  if [[ "$pm" == "apt" ]]; then
+    if install_pkg docker.io >/dev/null 2>&1; then ok=1; fi
+  elif [[ "$pm" == "dnf" || "$pm" == "yum" ]]; then
+    if install_pkg docker >/dev/null 2>&1; then ok=1; fi
   fi
-  systemctl enable --now docker || true
+
+  if [[ "$ok" -ne 1 ]]; then
+    warn "包管理器安装 Docker 失败，尝试使用官方脚本 get.docker.com"
+    if curl -fsSL https://get.docker.com | sh; then
+      ok=1
+    fi
+  fi
+
+  if [[ "$ok" -ne 1 ]]; then
+    err "Docker 安装失败。请检查网络/源后重试。"
+    return 1
+  fi
+
+  systemctl enable --now docker >/dev/null 2>&1 || true
+  has_cmd docker && log "Docker 安装完成" || { err "Docker 安装后仍不可用"; return 1; }
 }
 
+
 install_compose() {
+  ensure_basic_deps
   if docker compose version >/dev/null 2>&1; then
     log "Docker Compose 已可用"
     return 0
   fi
-  # 尝试安装 compose plugin
-  log "安装 Docker Compose"
-  if has_cmd apt-get; then
-    install_pkg docker-compose-plugin
-  elif has_cmd dnf || has_cmd yum; then
-    install_pkg docker-compose-plugin || install_pkg docker-compose || true
+
+  log "安装 Docker Compose（纯净鸡兼容：优先 compose plugin）"
+  local pm; pm="$(detect_pm)"
+
+  if [[ "$pm" == "apt" ]]; then
+    install_pkg docker-compose-plugin >/dev/null 2>&1 || true
+    docker compose version >/dev/null 2>&1 || install_pkg docker-compose >/dev/null 2>&1 || true
+  elif [[ "$pm" == "dnf" || "$pm" == "yum" ]]; then
+    install_pkg docker-compose-plugin >/dev/null 2>&1 || install_pkg docker-compose >/dev/null 2>&1 || true
   fi
-  docker compose version >/dev/null 2>&1 || { err "Docker Compose 安装失败"; return 1; }
+
+  docker compose version >/dev/null 2>&1 || { err "Docker Compose 安装失败（请确认 docker 已安装且源可用）"; return 1; }
+  log "Docker Compose 安装完成"
 }
+
 
 write_compose() {
   ensure_dirs
@@ -246,6 +299,12 @@ update_image() {
 
 # ----------------------- Nginx safe coexist helpers -----------------------
 
+ensure_acme_root() {
+  mkdir -p "$ACME_ROOT"
+  chmod 755 "$ACME_ROOT" || true
+}
+
+
 nginx_is_installed() { has_cmd nginx && [[ -d "$NGINX_DIR_AVAILABLE" ]]; }
 
 nginx_active() { systemctl is-active nginx >/dev/null 2>&1; }
@@ -272,24 +331,32 @@ backup_nginx_before_change() {
 }
 
 ensure_nginx_certbot() {
+  ensure_basic_deps
   log "安装 Nginx + Certbot（共存模式：不重启/不删除他人站点）"
 
-  # 安装 nginx（注意：某些系统安装后会尝试启动；这是系统行为，不由脚本强控）
   if ! nginx_is_installed; then
     install_pkg nginx
   else
     log "Nginx 已安装"
   fi
 
-  # 安装 certbot
   local pm; pm="$(detect_pm)"
+  if [[ "$pm" == "dnf" || "$pm" == "yum" ]]; then
+    install_pkg epel-release >/dev/null 2>&1 || true
+  fi
+
   case "$pm" in
-    apt) install_pkg certbot python3-certbot-nginx ;;
-    dnf|yum) install_pkg certbot python3-certbot-nginx || install_pkg certbot python3-certbot || true ;;
-    *) install_pkg certbot || true ;;
+    apt)
+      install_pkg certbot python3-certbot-nginx || install_pkg certbot || true
+      ;;
+    dnf|yum)
+      install_pkg certbot python3-certbot-nginx || install_pkg certbot python3-certbot || install_pkg certbot || true
+      ;;
+    *)
+      install_pkg certbot || true
+      ;;
   esac
 
-  # 不强制 restart nginx：如果当前 nginx 正在服务其他站点，重启会造成短暂中断
   systemctl enable nginx >/dev/null 2>&1 || true
 
   if port_in_use_by_non_nginx; then
@@ -299,6 +366,7 @@ ensure_nginx_certbot() {
     exit 1
   fi
 }
+
 
 nginx_site_path_for_domain() {
   # create a unique file per domain to avoid collisions
@@ -332,6 +400,12 @@ server {
   server_name ${domain};
 
   # Keep other sites untouched. This server block is ONLY for ${domain}.
+  # ACME challenge (Let's Encrypt webroot)
+  location ^~ /.well-known/acme-challenge/ {
+    root $ACME_ROOT;
+    try_files $uri =404;
+  }
+
   location / {
     proxy_pass http://127.0.0.1:${upstream_port};
     proxy_http_version 1.1;
@@ -364,11 +438,58 @@ obtain_https_cert() {
   local email="$2"
 
   has_cmd certbot || { err "certbot 未安装"; exit 1; }
+  ensure_acme_root
 
   log "申请 Let's Encrypt 证书（仅作用于 ${domain}，不会覆盖其他站点）"
-  # certbot --nginx 会在匹配 server_name 的站点上插入 443/证书配置
-  certbot --nginx -d "$domain" --non-interactive --agree-tos -m "$email" --redirect
 
+  local has_nginx_plugin=0
+  if certbot plugins 2>/dev/null | grep -qE '^\s*nginx\b'; then
+    has_nginx_plugin=1
+  fi
+
+  if [[ "$has_nginx_plugin" -eq 1 ]]; then
+    certbot --nginx -d "$domain" --non-interactive --agree-tos -m "$email" --redirect
+  else
+    warn "未检测到 certbot nginx 插件，改用 webroot 方式申请证书（更安全、零侵入）"
+    certbot certonly --webroot -w "$ACME_ROOT" -d "$domain" \
+      --non-interactive --agree-tos -m "$email" --keep-until-expiring
+
+    local site; site="$(nginx_site_path_for_domain "$domain")"
+    if [[ ! -f "$site" ]]; then
+      err "未找到站点配置：$site（请先生成 HTTP 反代配置）"
+      exit 1
+    fi
+
+    if ! grep -q "listen 443" "$site"; then
+      cat >>"$site" <<EOF
+
+server {
+  listen 443 ssl http2;
+  listen [::]:443 ssl http2;
+  server_name ${domain};
+
+  ssl_certificate /etc/letsencrypt/live/${domain}/fullchain.pem;
+  ssl_certificate_key /etc/letsencrypt/live/${domain}/privkey.pem;
+
+  location ^~ /.well-known/acme-challenge/ {
+    root ${ACME_ROOT};
+    try_files \$uri =404;
+  }
+
+  location / {
+    proxy_pass http://127.0.0.1:${PORT};
+    proxy_http_version 1.1;
+    proxy_set_header Host \$host;
+    proxy_set_header X-Real-IP \$remote_addr;
+    proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto \$scheme;
+  }
+}
+EOF
+    fi
+  fi
+
+  nginx -t
   if nginx_active; then
     systemctl reload nginx
   else
@@ -376,6 +497,7 @@ obtain_https_cert() {
   fi
   log "证书申请完成：${domain}"
 }
+
 
 setup_cert_renew() {
   # 自动续期：优先 systemd timer，其次 cron 兜底
@@ -386,7 +508,7 @@ setup_cert_renew() {
   fi
 
   if ! crontab -l 2>/dev/null | grep -q "certbot renew"; then
-    (crontab -l 2>/dev/null; echo "0 3 * * * certbot renew --quiet && systemctl reload nginx") | crontab -
+    (crontab -l 2>/dev/null; echo "0 3 * * * certbot renew --quiet && (systemctl reload nginx || nginx -s reload || true)") | crontab -
     log "已写入 cron 自动续期（每天 03:00）"
   fi
 }
