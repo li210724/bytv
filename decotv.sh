@@ -23,6 +23,7 @@ DOMAINS_FILE="${STATE_DIR}/domains"
 NGINX_DIR_AVAILABLE="/etc/nginx/sites-available"
 NGINX_DIR_ENABLED="/etc/nginx/sites-enabled"
 INSTALL_CMD_PATH="/usr/local/bin/decotv"
+RAW_URL="${RAW_URL:-https://raw.githubusercontent.com/li210724/bytv/main/decotv.sh}"
 
 # Default container mapping
 PORT="${PORT:-3000}"                 # host port -> container 3000
@@ -511,6 +512,7 @@ install_as_command() {
   local self
   self="$(readlink -f "$0" 2>/dev/null || true)"
 
+  # 1) 本地文件运行：直接复制自身
   if [[ -n "$self" && -f "$self" ]]; then
     install -m 0755 "$self" "$target"
     log "已安装系统命令：$target"
@@ -518,14 +520,31 @@ install_as_command() {
     return 0
   fi
 
-  warn "当前无法确定脚本本地路径（可能是通过管道运行）"
-  warn "建议：先下载脚本到文件，再执行本选项"
-  echo
-  echo "示例："
-  echo "  curl -fsSL https://raw.githubusercontent.com/li210724/bytv/main/decotv.sh -o decotv.sh"
-  echo "  bash decotv.sh"
-  echo "  # 再在菜单里选择“安装为系统命令(decotv)”"
+  # 2) 管道运行（curl|bash）：自动从 RAW_URL 下载并安装
+  warn "检测到可能是通过管道运行（无法定位脚本本地路径）。"
+  warn "将自动从仓库下载最新版并安装为系统命令：$target"
+  echo "  来源: $RAW_URL"
+  read -rp "确认继续安装为系统命令? (y/N): " yn
+  [[ "$yn" =~ ^[Yy]$ ]] || return 0
+
+  install_pkg ca-certificates curl >/dev/null 2>&1 || true
+  if ! has_cmd curl; then
+    err "缺少 curl，无法下载脚本。请先安装 curl 后重试。"
+    return 1
+  fi
+
+  local tmp="/tmp/decotv.$$.sh"
+  if ! curl -fsSL "$RAW_URL" -o "$tmp"; then
+    err "下载失败：$RAW_URL"
+    return 1
+  fi
+  chmod 0755 "$tmp"
+  mv -f "$tmp" "$target"
+  log "已安装系统命令：$target"
+  log "以后直接输入：decotv"
 }
+
+
 
 # -------------------------- Menu --------------------------
 
