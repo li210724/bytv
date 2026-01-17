@@ -1,56 +1,51 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# ==========================================================
-# DecoTV Full Ops Script (Nginx + Let's Encrypt + Backup)
-# Maintainer repo (this script): https://github.com/li210724/bytv
+# ==============================================================================
+# DecoTV 一键部署运维脚本（安全共存版）
+# Repo: https://github.com/li210724/bytv
 #
-# Highlights:
-#  - One menu to install & operate DecoTV (Docker Compose)
-#  - Optional Nginx reverse proxy + Let's Encrypt HTTPS (certbot)
-#  - Domain DNS -> local IP check (to avoid cert failures)
-#  - Backup / Restore
-#  - Update / Logs / Status
-#  - Full uninstall (containers + data + nginx conf + command)
+# 设计目标：
+#  - 不碰别人站点：只“新增”自己的 Nginx 配置，不覆盖、不删除 default、不重启 nginx
+#  - 能共存科技lion/Komari/其他站点：避免 80/443 端口抢占导致别人站点挂
+#  - 交互式菜单：部署 / HTTPS / 备份恢复 / 更新 / 卸载 / 安装为命令
 #
-# Security note:
-#  - This script supports "install as command" even when run via curl|bash,
-#    by downloading the pinned RAW script into /usr/local/bin/decotv.
-# ==========================================================
+# 注意：
+#  - 本脚本负责部署与运维，不修改 DecoTV 源码
+#  - HTTPS 使用 certbot --nginx（会修改“本脚本生成的站点配置”，不会改其他站点）
+# ==============================================================================
 
 APP_NAME="decotv"
 APP_DIR="${APP_DIR:-/opt/decotv}"
-DATA_DIR="$APP_DIR/data"
-BACKUP_DIR="$APP_DIR/backups"
-COMPOSE_FILE="$APP_DIR/docker-compose.yml"
+COMPOSE_FILE="${APP_DIR}/docker-compose.yml"
+STATE_DIR="${APP_DIR}/.state"
+DOMAINS_FILE="${STATE_DIR}/domains"
+NGINX_DIR_AVAILABLE="/etc/nginx/sites-available"
+NGINX_DIR_ENABLED="/etc/nginx/sites-enabled"
+INSTALL_CMD_PATH="/usr/local/bin/decotv"
 
+# Default container mapping
+PORT="${PORT:-3000}"                 # host port -> container 3000
 IMAGE="${IMAGE:-ghcr.io/decohererk/decotv:latest}"
-PORT="${PORT:-3000}"           # host port -> container 3000 (nginx proxies to this)
-DOMAIN="${DOMAIN:-}"           # set during install / https
-EMAIL="${EMAIL:-}"             # cert email
+KVROCKS_IMAGE="${KVROCKS_IMAGE:-apache/kvrocks:latest}"
 
-# Where to fetch the latest script if current runtime path is not a real file
-SCRIPT_RAW_URL="${SCRIPT_RAW_URL:-https://raw.githubusercontent.com/li210724/bytv/main/decotv.sh}"
-INSTALL_CMD_PATH="${INSTALL_CMD_PATH:-/usr/local/bin/decotv}"
-
-GREEN="\033[32m"
-RED="\033[31m"
-YELLOW="\033[33m"
-NC="\033[0m"
-
-[[ $EUID -ne 0 ]] && echo -e "${RED}请使用 root 执行${NC}" && exit 1
-
-log()  { echo -e "${GREEN}[+] $*${NC}"; }
-warn() { echo -e "${YELLOW}[!] $*${NC}"; }
-err()  { echo -e "${RED}[-] $*${NC}"; }
+# Colors
+RED="\033[31m"; GREEN="\033[32m"; YELLOW="\033[33m"; CYAN="\033[36m"; NC="\033[0m"
+log()  { echo -e "${GREEN}[+]${NC} $*"; }
+warn() { echo -e "${YELLOW}[!]${NC} $*"; }
+err()  { echo -e "${RED}[-]${NC} $*"; }
+info() { echo -e "${CYAN}[*]${NC} $*"; }
 
 pause() { read -rp "回车继续..." _ || true; }
 
-has_cmd() { command -v "$1" >/dev/null 2>&1; }
-
-get_ip() {
-  curl -s ipv4.icanhazip.com || curl -s ifconfig.me || true
+need_root() {
+  if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+    err "请使用 root 运行"
+    exit 1
+  fi
 }
+
+has_cmd() { command -v "$1" >/dev/null 2>&1; }
 
 detect_pm() {
   if has_cmd apt-get; then echo "apt"; return; fi
@@ -60,93 +55,134 @@ detect_pm() {
 }
 
 install_pkg() {
+  local pkgs=("$@")
   local pm; pm="$(detect_pm)"
   case "$pm" in
     apt)
+      export DEBIAN_FRONTEND=noninteractive
       apt-get update -y
-      DEBIAN_FRONTEND=noninteractive apt-get install -y "$@"
+      apt-get install -y "${pkgs[@]}"
       ;;
     dnf)
-      dnf install -y "$@"
+      dnf install -y "${pkgs[@]}"
       ;;
     yum)
-      yum install -y "$@"
+      yum install -y "${pkgs[@]}"
       ;;
     *)
-      err "不支持的系统包管理器，请手动安装: $*"
-      exit 1
+      err "未知包管理器，无法自动安装：${pkgs[*]}"
+      return 1
       ;;
   esac
 }
 
-install_docker() {
-  if has_cmd docker; then return; fi
-  log "安装 Docker"
-  curl -fsSL https://get.docker.com | sh
-  systemctl enable --now docker
+get_public_ipv4() {
+  curl -fsSL ipv4.icanhazip.com 2>/dev/null || curl -fsSL ifconfig.me 2>/dev/null || true
 }
 
-install_compose() {
-  if docker compose version >/dev/null 2>&1; then return; fi
-  log "安装 docker compose v2 插件"
-  mkdir -p /usr/local/lib/docker/cli-plugins
-  curl -SL https://github.com/docker/compose/releases/latest/download/docker-compose-linux-x86_64 \
-    -o /usr/local/lib/docker/cli-plugins/docker-compose
-  chmod +x /usr/local/lib/docker/cli-plugins/docker-compose
-}
-
-dns_ip() {
-  local domain="$1"
-  if has_cmd dig; then
-    dig +short A "$domain" | head -n1
-    return
+resolve_domain_ipv4() {
+  local d="$1"
+  # getent 优先，其次 dig
+  if has_cmd getent; then
+    getent ahostsv4 "$d" 2>/dev/null | awk '{print $1}' | head -n1 || true
+  elif has_cmd dig; then
+    dig +short A "$d" 2>/dev/null | head -n1 || true
+  else
+    # 最差方案：ping 解析
+    ping -c1 "$d" 2>/dev/null | sed -n 's/.*(\([0-9.]\+\)).*/\1/p' | head -n1 || true
   fi
-  ping -c1 "$domain" 2>/dev/null | sed -n '1s/.*(\(.*\)).*/\1/p'
 }
 
 check_domain_points_to_local() {
-  local domain="$1"
-  local local_ip domain_ip
-  local_ip="$(get_ip)"
-  if [[ -z "$local_ip" ]]; then
-    warn "无法自动获取本机公网 IP，将跳过解析校验"
+  local d="$1"
+  local pub; pub="$(get_public_ipv4)"
+  local dip; dip="$(resolve_domain_ipv4 "$d")"
+
+  if [[ -z "$pub" ]]; then
+    warn "无法获取本机公网 IPv4，跳过解析校验（建议安装 curl 并确保可访问外网）"
     return 0
   fi
-  domain_ip="$(dns_ip "$domain" || true)"
-  if [[ -z "$domain_ip" ]]; then
-    err "无法解析域名：$domain"
-    exit 1
+  if [[ -z "$dip" ]]; then
+    warn "无法解析域名 IPv4：$d（可能未生效/使用 AAAA/被污染）。如确认无误可继续。"
+    read -rp "仍要继续吗？(y/N): " yn
+    [[ "$yn" =~ ^[Yy]$ ]] || exit 1
+    return 0
   fi
-  if [[ "$domain_ip" == "$local_ip" ]]; then
-    log "域名已正确解析到本机 ($local_ip)"
+
+  if [[ "$dip" != "$pub" ]]; then
+    warn "域名解析 IPv4 不匹配："
+    warn "  域名 A 记录: $dip"
+    warn "  本机公网 IPv4: $pub"
+    warn "继续申请证书可能失败或申请到错误机器。"
+    read -rp "仍要继续吗？(y/N): " yn
+    [[ "$yn" =~ ^[Yy]$ ]] || exit 1
   else
-    err "域名解析未指向本机"
-    echo "  域名 IP: $domain_ip"
-    echo "  本机 IP: $local_ip"
-    exit 1
+    log "域名解析校验通过：$d -> $dip"
   fi
 }
 
-ufw_open_ports_if_any() {
-  if ! has_cmd ufw; then return 0; fi
-  if ! ufw status 2>/dev/null | grep -qi "Status: active"; then return 0; fi
-  warn "检测到 ufw 已启用，尝试放行 80/443/${PORT}"
-  ufw allow 80/tcp || true
-  ufw allow 443/tcp || true
-  ufw allow "${PORT}/tcp" || true
+ensure_dirs() {
+  mkdir -p "$APP_DIR" "$STATE_DIR" "$APP_DIR/backups"
+  touch "$DOMAINS_FILE"
+}
+
+record_domain() {
+  local d="$1"
+  ensure_dirs
+  grep -qxF "$d" "$DOMAINS_FILE" 2>/dev/null || echo "$d" >>"$DOMAINS_FILE"
+}
+
+list_recorded_domains() {
+  ensure_dirs
+  sed '/^\s*$/d' "$DOMAINS_FILE" 2>/dev/null || true
+}
+
+install_docker() {
+  if has_cmd docker; then
+    log "Docker 已安装"
+    return 0
+  fi
+  log "安装 Docker"
+  install_pkg ca-certificates curl gnupg lsb-release
+  if has_cmd apt-get; then
+    install_pkg docker.io
+  else
+    install_pkg docker
+  fi
+  systemctl enable --now docker || true
+}
+
+install_compose() {
+  if docker compose version >/dev/null 2>&1; then
+    log "Docker Compose 已可用"
+    return 0
+  fi
+  # 尝试安装 compose plugin
+  log "安装 Docker Compose"
+  if has_cmd apt-get; then
+    install_pkg docker-compose-plugin
+  elif has_cmd dnf || has_cmd yum; then
+    install_pkg docker-compose-plugin || install_pkg docker-compose || true
+  fi
+  docker compose version >/dev/null 2>&1 || { err "Docker Compose 安装失败"; return 1; }
 }
 
 write_compose() {
-  mkdir -p "$APP_DIR" "$DATA_DIR" "$BACKUP_DIR"
+  ensure_dirs
+  local username password
+  read -rp "后台用户名: " username
+  read -rp "后台密码: " password
+  [[ -z "$username" || -z "$password" ]] && err "用户名/密码不能为空" && exit 1
 
   cat >"$COMPOSE_FILE" <<EOF
 version: "3.8"
+
 services:
   kvrocks:
-    image: apache/kvrocks
+    image: ${KVROCKS_IMAGE}
     restart: always
     volumes:
-      - ./data:/data
+      - ./kvrocks-data:/data
 
   decotv:
     image: ${IMAGE}
@@ -154,89 +190,196 @@ services:
     ports:
       - "${PORT}:3000"
     environment:
-      USERNAME: "${USERNAME}"
-      PASSWORD: "${PASSWORD}"
+      USERNAME: "${username}"
+      PASSWORD: "${password}"
       NEXT_PUBLIC_STORAGE_TYPE: kvrocks
       KVROCKS_URL: redis://kvrocks:6666
     depends_on:
       - kvrocks
 EOF
+
+  log "已写入 Compose：$COMPOSE_FILE"
 }
 
 compose_up()   { docker compose -f "$COMPOSE_FILE" up -d; }
 compose_down() { docker compose -f "$COMPOSE_FILE" down || true; }
 compose_down_volumes() { docker compose -f "$COMPOSE_FILE" down -v || true; }
 
-install_nginx_certbot() {
-  log "安装 Nginx + Certbot"
-  install_pkg nginx
+ensure_installed() {
+  if [[ ! -f "$COMPOSE_FILE" ]]; then
+    err "未检测到安装：$COMPOSE_FILE"
+    err "请先选择 1) 安装/部署"
+    exit 1
+  fi
+}
 
+show_info() {
+  ensure_dirs
+  echo
+  echo "=============================="
+  echo " ${APP_NAME} 信息"
+  echo "=============================="
+  echo "安装目录: $APP_DIR"
+  echo "Compose:  $COMPOSE_FILE"
+  echo "镜像:     $IMAGE"
+  echo "端口:     $PORT -> 3000"
+  echo "已记录域名:"
+  list_recorded_domains | sed 's/^/  - /' || true
+  echo "=============================="
+  echo
+}
+
+status()  { ensure_installed; docker compose -f "$COMPOSE_FILE" ps; }
+start_app()   { ensure_installed; compose_up; log "已启动"; }
+stop_app()    { ensure_installed; compose_down; log "已停止"; }
+restart_app() { ensure_installed; docker compose -f "$COMPOSE_FILE" restart; log "已重启"; }
+logs_app()    { ensure_installed; docker compose -f "$COMPOSE_FILE" logs --tail 200 -f; }
+
+update_image() {
+  ensure_installed
+  log "拉取最新镜像并更新"
+  docker compose -f "$COMPOSE_FILE" pull
+  docker compose -f "$COMPOSE_FILE" up -d
+  log "更新完成"
+}
+
+# ----------------------- Nginx safe coexist helpers -----------------------
+
+nginx_is_installed() { has_cmd nginx && [[ -d "$NGINX_DIR_AVAILABLE" ]]; }
+
+nginx_active() { systemctl is-active nginx >/dev/null 2>&1; }
+
+port_in_use_by_non_nginx() {
+  # return 0 if 80 is used by something other than nginx
+  if ! has_cmd ss; then install_pkg iproute2 >/dev/null 2>&1 || true; fi
+  local out
+  out="$(ss -lntp 2>/dev/null | awk '$4 ~ /:80$/ {print}' || true)"
+  [[ -z "$out" ]] && return 1
+  echo "$out" | grep -q "nginx" && return 1
+  return 0
+}
+
+backup_nginx_before_change() {
+  # Only backup once per run; safe and lightweight
+  ensure_dirs
+  local ts; ts="$(date +%Y%m%d-%H%M%S)"
+  local bk="$APP_DIR/backups/nginx-sites-$ts.tar.gz"
+  if [[ -d "$NGINX_DIR_AVAILABLE" || -d "$NGINX_DIR_ENABLED" ]]; then
+    tar -czf "$bk" "$NGINX_DIR_AVAILABLE" "$NGINX_DIR_ENABLED" 2>/dev/null || true
+    log "已备份 Nginx 站点配置到：$bk"
+  fi
+}
+
+ensure_nginx_certbot() {
+  log "安装 Nginx + Certbot（共存模式：不重启/不删除他人站点）"
+
+  # 安装 nginx（注意：某些系统安装后会尝试启动；这是系统行为，不由脚本强控）
+  if ! nginx_is_installed; then
+    install_pkg nginx
+  else
+    log "Nginx 已安装"
+  fi
+
+  # 安装 certbot
   local pm; pm="$(detect_pm)"
   case "$pm" in
     apt) install_pkg certbot python3-certbot-nginx ;;
     dnf|yum) install_pkg certbot python3-certbot-nginx || install_pkg certbot python3-certbot || true ;;
+    *) install_pkg certbot || true ;;
   esac
 
-  systemctl enable --now nginx
+  # 不强制 restart nginx：如果当前 nginx 正在服务其他站点，重启会造成短暂中断
+  systemctl enable nginx >/dev/null 2>&1 || true
+
+  if port_in_use_by_non_nginx; then
+    err "检测到 80 端口被非 Nginx 程序占用，无法安全启用反代。"
+    err "请先释放 80（或迁移到 Nginx），再启用 HTTPS/反代。"
+    ss -lntp 2>/dev/null | grep ':80' || true
+    exit 1
+  fi
 }
 
-nginx_site_path() { echo "/etc/nginx/sites-available/${APP_NAME}.conf"; }
-nginx_site_link() { echo "/etc/nginx/sites-enabled/${APP_NAME}.conf"; }
+nginx_site_path_for_domain() {
+  # create a unique file per domain to avoid collisions
+  local d="$1"
+  local safe="${d//[^a-zA-Z0-9._-]/_}"
+  echo "${NGINX_DIR_AVAILABLE}/${APP_NAME}-${safe}.conf"
+}
 
-write_nginx_http_conf() {
+nginx_link_path_for_domain() {
+  local d="$1"
+  local safe="${d//[^a-zA-Z0-9._-]/_}"
+  echo "${NGINX_DIR_ENABLED}/${APP_NAME}-${safe}.conf"
+}
+
+write_nginx_proxy_http_conf() {
   local domain="$1"
-  local site; site="$(nginx_site_path)"
+  local upstream_port="$2"
 
+  backup_nginx_before_change
+
+  mkdir -p "$NGINX_DIR_AVAILABLE" "$NGINX_DIR_ENABLED"
+
+  local site; site="$(nginx_site_path_for_domain "$domain")"
   cat >"$site" <<EOF
-# Auto-generated by ${APP_NAME} script
+# Auto-generated by ${APP_NAME} script (safe coexist mode)
+# Domain: ${domain}
+# Upstream: http://127.0.0.1:${upstream_port}
 server {
-    listen 80;
-    listen [::]:80;
-    server_name ${domain};
+  listen 80;
+  listen [::]:80;
+  server_name ${domain};
 
-    # ACME challenge (certbot)
-    location /.well-known/acme-challenge/ {
-        root /var/www/html;
-    }
-
-    location / {
-        proxy_pass http://127.0.0.1:${PORT};
-        proxy_http_version 1.1;
-        proxy_set_header Host \$host;
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto \$scheme;
-    }
+  # Keep other sites untouched. This server block is ONLY for ${domain}.
+  location / {
+    proxy_pass http://127.0.0.1:${upstream_port};
+    proxy_http_version 1.1;
+    proxy_set_header Host \$host;
+    proxy_set_header X-Real-IP \$remote_addr;
+    proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto \$scheme;
+  }
 }
 EOF
 
-  if [[ -d /etc/nginx/sites-enabled ]]; then
-    ln -sf "$site" "$(nginx_site_link)"
-    rm -f /etc/nginx/sites-enabled/default 2>/dev/null || true
-  fi
+  ln -sf "$site" "$(nginx_link_path_for_domain "$domain")"
 
   nginx -t
-  systemctl reload nginx
+  # 关键：不 restart，只 reload（避免影响其他站点）
+  if nginx_active; then
+    systemctl reload nginx
+  else
+    # 如果 nginx 没在跑，就 start（此时不会“重启别人”，因为根本没在跑）
+    systemctl start nginx || true
+    nginx_active && log "Nginx 已启动" || warn "Nginx 启动失败（可能端口冲突），但配置已写入。请手动排查后再启动。"
+  fi
+
+  record_domain "$domain"
+  log "已写入并启用 Nginx 站点：$site"
 }
 
 obtain_https_cert() {
   local domain="$1"
   local email="$2"
 
-  if ! has_cmd certbot; then
-    err "certbot 未安装"
-    exit 1
-  fi
+  has_cmd certbot || { err "certbot 未安装"; exit 1; }
 
-  log "申请 Let's Encrypt 证书 (certbot --nginx)"
+  log "申请 Let's Encrypt 证书（仅作用于 ${domain}，不会覆盖其他站点）"
+  # certbot --nginx 会在匹配 server_name 的站点上插入 443/证书配置
   certbot --nginx -d "$domain" --non-interactive --agree-tos -m "$email" --redirect
-  systemctl reload nginx
-  log "证书申请完成"
+
+  if nginx_active; then
+    systemctl reload nginx
+  else
+    systemctl start nginx || true
+  fi
+  log "证书申请完成：${domain}"
 }
 
 setup_cert_renew() {
+  # 自动续期：优先 systemd timer，其次 cron 兜底
   if systemctl list-unit-files 2>/dev/null | grep -q "^certbot.timer"; then
-    systemctl enable --now certbot.timer || true
+    systemctl enable --now certbot.timer >/dev/null 2>&1 || true
     log "已启用 certbot.timer 自动续期"
     return
   fi
@@ -247,143 +390,93 @@ setup_cert_renew() {
   fi
 }
 
-install_flow() {
-  log "开始部署 DecoTV"
-
-  read -rp "后台用户名: " USERNAME
-  read -rp "后台密码: " PASSWORD
-
-  read -rp "是否启用域名反代(Nginx)? (y/N): " yn
-  local use_nginx=0
-  local with_https=0
-  if [[ "$yn" =~ ^[Yy]$ ]]; then
-    use_nginx=1
-    read -rp "请输入域名(例如 tv.example.com): " DOMAIN
-    check_domain_points_to_local "$DOMAIN"
-
-    read -rp "是否自动申请 HTTPS 证书(Let's Encrypt)? (y/N): " yn2
-    if [[ "$yn2" =~ ^[Yy]$ ]]; then
-      with_https=1
-      read -rp "证书注册邮箱(用于到期通知): " EMAIL
-      [[ -z "$EMAIL" ]] && err "邮箱不能为空" && exit 1
-    fi
-  fi
-
-  install_docker
-  install_compose
-
-  write_compose
-  compose_up
-
-  ufw_open_ports_if_any
-
-  if [[ "$use_nginx" == "1" ]]; then
-    install_nginx_certbot
-    write_nginx_http_conf "$DOMAIN"
-    if [[ "$with_https" == "1" ]]; then
-      obtain_https_cert "$DOMAIN" "$EMAIL"
-      setup_cert_renew
-    else
-      warn "未启用 HTTPS：你可以稍后用“启用 HTTPS/证书”或命令 decotv https 启用"
-    fi
-  fi
-
-  log "部署完成"
-  if [[ "$use_nginx" == "1" ]]; then
-    if [[ "$with_https" == "1" ]]; then
-      echo "访问地址: https://${DOMAIN}"
-    else
-      echo "访问地址: http://${DOMAIN}"
-    fi
-  else
-    echo "访问地址: http://$(get_ip):${PORT}"
-  fi
-}
-
-ensure_installed() {
-  if [[ ! -f "$COMPOSE_FILE" ]]; then
-    err "未检测到安装：$COMPOSE_FILE 不存在"
-    exit 1
-  fi
-}
-
-status()  { ensure_installed; docker compose -f "$COMPOSE_FILE" ps; }
-start()   { ensure_installed; docker compose -f "$COMPOSE_FILE" up -d; log "已启动"; }
-stop()    { ensure_installed; docker compose -f "$COMPOSE_FILE" down; log "已停止"; }
-restart() { ensure_installed; docker compose -f "$COMPOSE_FILE" restart; log "已重启"; }
-logs()    { ensure_installed; docker compose -f "$COMPOSE_FILE" logs --tail 200 -f; }
-
-update_image() {
-  ensure_installed
-  log "拉取最新镜像并更新"
-  docker compose -f "$COMPOSE_FILE" pull
-  docker compose -f "$COMPOSE_FILE" up -d
-  log "更新完成"
-}
-
 https_enable_flow() {
   ensure_installed
-  [[ -z "${DOMAIN}" ]] && read -rp "请输入域名(例如 tv.example.com): " DOMAIN
-  check_domain_points_to_local "$DOMAIN"
-  [[ -z "${EMAIL}" ]] && read -rp "证书注册邮箱(用于到期通知): " EMAIL
-  [[ -z "${EMAIL}" ]] && err "邮箱不能为空" && exit 1
+  local domain email
+  read -rp "请输入域名(例如 tv.example.com): " domain
+  [[ -z "$domain" ]] && err "域名不能为空" && exit 1
 
-  install_nginx_certbot
-  write_nginx_http_conf "$DOMAIN"
-  obtain_https_cert "$DOMAIN" "$EMAIL"
-  setup_cert_renew
+  check_domain_points_to_local "$domain"
+  ensure_nginx_certbot
 
-  log "HTTPS 已启用：https://${DOMAIN}"
+  # 写入仅针对该域名的 80 反代（不动 default / 不动其他站点）
+  write_nginx_proxy_http_conf "$domain" "$PORT"
+
+  read -rp "是否申请/启用 HTTPS 证书(Let's Encrypt)? (y/N): " yn
+  if [[ "$yn" =~ ^[Yy]$ ]]; then
+    read -rp "证书注册邮箱(用于到期通知): " email
+    [[ -z "$email" ]] && err "邮箱不能为空" && exit 1
+    obtain_https_cert "$domain" "$email"
+    setup_cert_renew
+    log "HTTPS 已启用：https://${domain}"
+  else
+    log "已启用 HTTP 反代：http://${domain}"
+  fi
 }
+
+# -------------------------- Backup / Restore --------------------------
 
 backup_create() {
   ensure_installed
-  mkdir -p "$BACKUP_DIR"
-  local ts file tmp_tar
-  ts="$(date +%Y%m%d_%H%M%S)"
-  file="$BACKUP_DIR/${APP_NAME}_backup_${ts}.tar.gz"
-  tmp_tar="${file%.gz}"
+  ensure_dirs
+  local ts; ts="$(date +%Y%m%d-%H%M%S)"
+  local out="$APP_DIR/backups/backup-$ts.tar.gz"
 
-  log "创建备份：$file"
-  tar -cf "$tmp_tar" -C "$APP_DIR" "data" "docker-compose.yml" 2>/dev/null || true
-  if [[ -f "$(nginx_site_path)" ]]; then
-    tar -rf "$tmp_tar" -C / "$(nginx_site_path)" 2>/dev/null || true
-  fi
-  gzip -f "$tmp_tar" 2>/dev/null || true
+  # 只备份“本项目相关”的内容：APP_DIR + 我们生成的 nginx conf（按记录域名）
+  local tmpdir; tmpdir="$(mktemp -d)"
+  mkdir -p "$tmpdir/nginx/sites-available" "$tmpdir/nginx/sites-enabled"
 
-  log "备份完成"
-  echo "$file"
+  while read -r d; do
+    [[ -z "$d" ]] && continue
+    local p1 p2
+    p1="$(nginx_site_path_for_domain "$d")"
+    p2="$(nginx_link_path_for_domain "$d")"
+    [[ -f "$p1" ]] && cp -a "$p1" "$tmpdir/nginx/sites-available/" || true
+    [[ -L "$p2" || -f "$p2" ]] && cp -a "$p2" "$tmpdir/nginx/sites-enabled/" || true
+  done < <(list_recorded_domains)
+
+  tar -czf "$out" -C / "${APP_DIR#/}" -C "$tmpdir" nginx 2>/dev/null || true
+  rm -rf "$tmpdir" || true
+  log "备份完成：$out"
 }
 
-backup_list() { mkdir -p "$BACKUP_DIR"; ls -lah "$BACKUP_DIR" || true; }
+backup_list() {
+  ensure_dirs
+  ls -lh "$APP_DIR/backups" 2>/dev/null || true
+}
 
 backup_restore() {
   ensure_installed
-  mkdir -p "$BACKUP_DIR"
-  read -rp "请输入备份文件完整路径(.tar.gz): " BK
-  [[ ! -f "$BK" ]] && err "文件不存在：$BK" && exit 1
+  ensure_dirs
+  backup_list
+  read -rp "输入要恢复的备份文件名(例如 backup-xxxx.tar.gz): " f
+  local bk="$APP_DIR/backups/$f"
+  [[ ! -f "$bk" ]] && err "不存在：$bk" && exit 1
 
-  warn "恢复会覆盖当前数据与配置"
-  read -rp "确认恢复? 输入 yes: " CONFIRM
-  [[ "$CONFIRM" != "yes" ]] && exit 0
+  warn "即将恢复备份：$bk（仅恢复本项目目录与本项目生成的 nginx 配置文件）"
+  read -rp "确认继续? 输入 yes: " yes
+  [[ "$yes" != "yes" ]] && exit 0
 
-  stop
-  log "解压恢复到 $APP_DIR"
-  mkdir -p "$APP_DIR"
-  tar -xzf "$BK" -C "$APP_DIR" || true
+  # 恢复 APP_DIR
+  tar -xzf "$bk" -C / --overwrite
 
-  if tar -tzf "$BK" | grep -q "^etc/nginx"; then
-    warn "检测到 Nginx 配置备份，将恢复到系统目录"
-    tar -xzf "$BK" -C / --overwrite || true
+  # 恢复本项目 nginx 配置（不会覆盖其他站点）
+  if [[ -d "/nginx" ]]; then
+    mkdir -p "$NGINX_DIR_AVAILABLE" "$NGINX_DIR_ENABLED"
+    cp -a /nginx/sites-available/* "$NGINX_DIR_AVAILABLE/" 2>/dev/null || true
+    cp -a /nginx/sites-enabled/* "$NGINX_DIR_ENABLED/" 2>/dev/null || true
+    rm -rf /nginx 2>/dev/null || true
     nginx -t && systemctl reload nginx || true
   fi
 
-  start
+  compose_up
   log "恢复完成"
 }
 
+# -------------------------- Uninstall (safe) --------------------------
+
 uninstall_all() {
-  warn "即将彻底卸载 DecoTV（容器+数据+Nginx配置+命令）"
+  warn "即将卸载 ${APP_NAME}（仅移除本项目容器/数据/本项目生成的 Nginx 配置/命令，不碰其他站点）"
   read -rp "确认卸载? 输入 yes: " CONFIRM
   [[ "$CONFIRM" != "yes" ]] && exit 0
 
@@ -391,63 +484,58 @@ uninstall_all() {
     compose_down_volumes
   fi
 
+  # 删除本项目 nginx 配置（按记录域名）
+  if nginx_is_installed; then
+    while read -r d; do
+      [[ -z "$d" ]] && continue
+      rm -f "$(nginx_site_path_for_domain "$d")" "$(nginx_link_path_for_domain "$d")" 2>/dev/null || true
+      # 可选：移除 certbot 证书（只移除该域名）
+      if has_cmd certbot; then
+        certbot delete --cert-name "$d" --non-interactive >/dev/null 2>&1 || true
+      fi
+    done < <(list_recorded_domains)
+
+    nginx -t && systemctl reload nginx || true
+  fi
+
   rm -rf "$APP_DIR"
-  rm -f "$(nginx_site_path)" "$(nginx_site_link)" 2>/dev/null || true
-  systemctl reload nginx 2>/dev/null || true
   rm -f "$INSTALL_CMD_PATH" 2>/dev/null || true
 
   log "卸载完成"
 }
 
+# -------------------------- Install as command --------------------------
+
 install_as_command() {
   local target="$INSTALL_CMD_PATH"
-  local self; self="$(readlink -f "$0" 2>/dev/null || true)"
+  local self
+  self="$(readlink -f "$0" 2>/dev/null || true)"
 
-  # If current script is a normal file, install from it
-  if [[ -n "$self" && -f "$self" && "$self" != /proc/*/fd/* ]]; then
-    cp -f "$self" "$target"
-    chmod +x "$target"
-    log "已安装快捷指令：$(basename "$target")"
-  else
-    # Running via pipe/FD; download from RAW URL
-    warn "检测到脚本可能通过 curl|bash 方式运行（非落盘文件）"
-    warn "将从仓库 RAW 地址下载脚本并安装为系统命令：$target"
-    if ! has_cmd curl; then
-      err "curl 未安装，无法下载脚本"
-      exit 1
-    fi
-    curl -fsSL "$SCRIPT_RAW_URL" -o "$target"
-    chmod +x "$target"
-    log "已下载并安装快捷指令：$(basename "$target")"
+  if [[ -n "$self" && -f "$self" ]]; then
+    install -m 0755 "$self" "$target"
+    log "已安装系统命令：$target"
+    log "以后直接输入：decotv"
+    return 0
   fi
 
+  warn "当前无法确定脚本本地路径（可能是通过管道运行）"
+  warn "建议：先下载脚本到文件，再执行本选项"
   echo
-  echo "现在你可以直接使用："
-  echo "  decotv            # 打开快捷启动面板"
-  echo "  decotv status     # 查看状态"
-  echo "  decotv https      # 启用/修复 HTTPS 证书"
-  echo "  decotv backup     # 创建备份"
-  echo
+  echo "示例："
+  echo "  curl -fsSL https://raw.githubusercontent.com/li210724/bytv/main/decotv.sh -o decotv.sh"
+  echo "  bash decotv.sh"
+  echo "  # 再在菜单里选择“安装为系统命令(decotv)”"
 }
 
-show_info() {
-  echo "------------------------------"
-  echo "App: ${APP_NAME}"
-  echo "Dir: ${APP_DIR}"
-  echo "Compose: ${COMPOSE_FILE}"
-  echo "Image: ${IMAGE}"
-  echo "Port: ${PORT}"
-  [[ -n "${DOMAIN}" ]] && echo "Domain: ${DOMAIN}"
-  echo "Public IP: $(get_ip)"
-  echo "------------------------------"
-}
+# -------------------------- Menu --------------------------
 
 menu() {
+  need_root
   while true; do
     clear || true
-    echo "=============================================="
-    echo "  DecoTV 快捷启动面板  (Nginx+HTTPS+备份/恢复)"
-    echo "=============================================="
+    echo "============================================================"
+    echo " DecoTV 快捷启动面板（Nginx+HTTPS+备份/恢复）"
+    echo "============================================================"
     echo " 1) 安装/部署"
     echo " 2) 信息"
     echo " 3) 状态"
@@ -456,23 +544,30 @@ menu() {
     echo " 6) 重启"
     echo " 7) 查看日志 (tail -f)"
     echo " 8) 更新镜像"
-    echo " 9) 启用 HTTPS/证书 (Nginx+Certbot)"
+    echo " 9) 启用 HTTPS/证书（Nginx+Certbot）"
     echo "10) 创建备份"
     echo "11) 备份列表"
     echo "12) 恢复备份"
     echo "13) 安装为系统命令(decotv)"
-    echo "14) 彻底卸载(含数据/配置)"
+    echo "14) 彻底卸载（含数据/配置）"
     echo " 0) 退出"
-    echo "----------------------------------------------"
-    read -rp "请选择: " CHOICE
-    case "$CHOICE" in
-      1) install_flow; pause ;;
+    echo "------------------------------------------------------------"
+    read -rp "请选择: " n
+    case "$n" in
+      1)
+        install_docker
+        install_compose
+        write_compose
+        compose_up
+        log "部署完成：请访问 http://服务器IP:${PORT} 或通过 Nginx 反代使用域名"
+        pause
+        ;;
       2) show_info; pause ;;
       3) status; pause ;;
-      4) start; pause ;;
-      5) stop; pause ;;
-      6) restart; pause ;;
-      7) logs ;;
+      4) start_app; pause ;;
+      5) stop_app; pause ;;
+      6) restart_app; pause ;;
+      7) logs_app ;;
       8) update_image; pause ;;
       9) https_enable_flow; pause ;;
       10) backup_create; pause ;;
@@ -481,46 +576,44 @@ menu() {
       13) install_as_command; pause ;;
       14) uninstall_all; pause ;;
       0) exit 0 ;;
-      *) err "无效选项"; pause ;;
+      *) warn "无效选择"; pause ;;
     esac
   done
 }
 
 usage() {
   cat <<EOF
-用法:
-  decotv                 打开快捷启动面板(交互菜单)
-  decotv install         交互安装/部署
-  decotv info            显示信息
-  decotv status          查看状态
-  decotv start|stop      启动/停止
-  decotv restart         重启
-  decotv logs            跟随日志
-  decotv update          更新镜像并重启容器
-  decotv https           启用/修复 Nginx + HTTPS 证书
-  decotv backup          创建备份
-  decotv backups         列出备份
-  decotv restore         恢复备份(交互输入文件)
-  decotv cmd             安装为系统命令 /usr/local/bin/decotv
-  decotv uninstall       彻底卸载(含数据/配置)
+用法：
+  bash decotv.sh              # 进入交互菜单
+  decotv                      #（安装为命令后）进入交互菜单
 
-环境变量(可选):
-  SCRIPT_RAW_URL         作为命令安装时的脚本下载地址
-  APP_DIR PORT IMAGE     自定义部署目录/端口/镜像
+子命令：
+  decotv menu|install|info|status|start|stop|restart|logs|update|https|backup|backups|restore|cmd|uninstall
+
+环境变量(可选)：
+  APP_DIR PORT IMAGE KVROCKS_IMAGE
+
+说明：
+  - 本脚本为“安全共存版”：不会删除 /etc/nginx/sites-enabled/default
+  - 仅新增自己的站点配置：/etc/nginx/sites-available/decotv-<domain>.conf
+  - 仅移除自己生成的配置与证书，不影响其他站点
 EOF
 }
 
-# ---------- CLI entry ----------
+# -------------------------- CLI entry --------------------------
+
+need_root
+
 cmd="${1:-}"
 case "$cmd" in
   ""|"menu") menu ;;
-  "install") install_flow ;;
+  "install") install_docker; install_compose; write_compose; compose_up ;;
   "info") show_info ;;
   "status") status ;;
-  "start") start ;;
-  "stop") stop ;;
-  "restart") restart ;;
-  "logs") logs ;;
+  "start") start_app ;;
+  "stop") stop_app ;;
+  "restart") restart_app ;;
+  "logs") logs_app ;;
   "update") update_image ;;
   "https") https_enable_flow ;;
   "backup") backup_create ;;
