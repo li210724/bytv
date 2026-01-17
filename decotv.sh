@@ -20,6 +20,7 @@ APP_DIR="/opt/decotv"
 STATE_DIR="${APP_DIR}/state"
 BACKUP_DIR="${APP_DIR}/backups"
 DOMAINS_FILE="${STATE_DIR}/domains"
+CREDS_FILE="${STATE_DIR}/credentials"
 NGINX_MODE_FILE="${STATE_DIR}/nginx_mode"
 ACME_ROOT="${ACME_ROOT:-/var/www/_acme}"
 
@@ -29,7 +30,7 @@ RAW_URL="${RAW_URL:-https://raw.githubusercontent.com/li210724/bytv/main/decotv.
 PORT="${PORT:-3000}"
 KVROCKS_PORT="${KVROCKS_PORT:-6666}"
 
-DECOTV_IMAGE="${DECOTV_IMAGE:-decohererk/decotv:latest}"
+DECOTV_IMAGE="${DECOTV_IMAGE:-ghcr.io/decohererk/decotv:latest}"
 KVROCKS_IMAGE="${KVROCKS_IMAGE:-apache/kvrocks:latest}"
 
 GREEN="\033[32m"; RED="\033[31m"; YELLOW="\033[33m"; CYAN="\033[36m"; NC="\033[0m"
@@ -156,6 +157,46 @@ install_compose() {
 
 ensure_dirs() { mkdir -p "$APP_DIR" "$STATE_DIR" "$BACKUP_DIR" "${APP_DIR}/data/kvrocks"; }
 
+
+ensure_credentials() {
+  ensure_dirs
+  local u p
+  # 若已有凭据则复用（避免每次重装都换密码）
+  if [[ -f "$CREDS_FILE" ]]; then
+    # shellcheck disable=SC1090
+    source "$CREDS_FILE" || true
+    if [[ -n "${ADMIN_USER:-}" && -n "${ADMIN_PASS:-}" ]]; then
+      export ADMIN_USER ADMIN_PASS
+      {
+        echo "ADMIN_USER=${ADMIN_USER}"
+        echo "ADMIN_PASS=${ADMIN_PASS}"
+      } > "${APP_DIR}/.env"
+      return 0
+    fi
+  fi
+
+  prompt "后台用户名（留空默认 admin）" u ""
+  [[ -n "$u" ]] || u="admin"
+
+  prompt "后台密码（留空自动生成强密码）" p ""
+  [[ -n "$p" ]] || p="$(gen_pass)"
+
+  ADMIN_USER="$u"
+  ADMIN_PASS="$p"
+  export ADMIN_USER ADMIN_PASS
+
+  {
+    echo "ADMIN_USER=${ADMIN_USER}"
+    echo "ADMIN_PASS=${ADMIN_PASS}"
+  } > "${APP_DIR}/.env"
+
+  {
+    echo "ADMIN_USER=${ADMIN_USER}"
+    echo "ADMIN_PASS=${ADMIN_PASS}"
+  } > "$CREDS_FILE"
+  chmod 600 "$CREDS_FILE" 2>/dev/null || true
+}
+
 write_compose() {
   ensure_dirs
   cat >"${APP_DIR}/docker-compose.yml" <<EOF
@@ -175,9 +216,13 @@ services:
     restart: unless-stopped
     ports:
       - "${PORT}:3000"
+    env_file:
+      - .env
     environment:
       - KVROCKS_HOST=kvrocks
       - KVROCKS_PORT=6666
+      - ADMIN_USER=${ADMIN_USER}
+      - ADMIN_PASS=${ADMIN_PASS}
     depends_on:
       - kvrocks
 EOF
@@ -186,9 +231,14 @@ EOF
 app_up() {
   install_docker
   install_compose
+  ensure_credentials
   write_compose
   (cd "$APP_DIR" && docker compose up -d)
   log "部署完成：服务端口 http://服务器IP:${PORT}"
+  echo
+  echo "后台用户名：${ADMIN_USER}"
+  echo "后台密码：${ADMIN_PASS}"
+  echo "（如应用不使用该账号体系，可忽略；脚本仍会保留并在重装时复用）"
 }
 
 app_status() { (cd "$APP_DIR" && docker compose ps) || true; }
@@ -372,7 +422,9 @@ https_enable_flow() {
   prompt "请输入域名（例如 tv.example.com）" domain ""
   [[ -n "$domain" ]] || { err "域名不能为空"; return 1; }
   local suggest="admin@${domain#*.}"
-  prompt "请输入邮箱（用于 Let's Encrypt）" email "$suggest"
+  prompt "请输入邮箱（可留空，不接收续期通知）" email "$suggest"
+  # 允许用户输入 - 来清空邮箱
+  if [[ "$email" == "-" ]]; then email=""; fi
 
   ensure_nginx_and_certbot
   scan_domain_conflict "$domain"
@@ -527,6 +579,12 @@ show_config() {
   echo "KVROCKS_IMAGE=$KVROCKS_IMAGE"
   echo "ACME_ROOT=$ACME_ROOT"
   echo "RAW_URL=$RAW_URL"
+  if [[ -f "$CREDS_FILE" ]]; then
+    # shellcheck disable=SC1090
+    source "$CREDS_FILE" || true
+    [[ -n "${ADMIN_USER:-}" ]] && echo "ADMIN_USER=${ADMIN_USER}"
+    [[ -n "${ADMIN_PASS:-}" ]] && echo "ADMIN_PASS=********"
+  fi
   echo
   if [[ -f "$DOMAINS_FILE" ]]; then
     echo "已启用 HTTPS 的域名："
@@ -581,3 +639,13 @@ case "$cmd" in
   self) install_as_command ;;
   *) err "未知命令：$cmd"; echo "可用：menu|install|status|start|stop|restart|logs|update|backup|https|uninstall|self"; exit 1 ;;
 esac
+gen_pass() {
+  # 24 chars strong password
+  local chars='ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!@#%^*_-+='
+  local pass=""
+  for _ in $(seq 1 24); do
+    pass+="${chars:RANDOM%${#chars}:1}"
+  done
+  echo "$pass"
+}
+
