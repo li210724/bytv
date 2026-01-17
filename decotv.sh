@@ -229,8 +229,6 @@ write_compose() {
   [[ -z "$username" || -z "$password" ]] && err "用户名/密码不能为空" && exit 1
 
   cat >"$COMPOSE_FILE" <<EOF
-version: "3.8"
-
 services:
   kvrocks:
     image: ${KVROCKS_IMAGE}
@@ -298,6 +296,21 @@ update_image() {
 }
 
 # ----------------------- Nginx safe coexist helpers -----------------------
+
+scan_nginx_domain_conflict() {
+  local domain="$1"
+  if ! nginx_is_installed; then return 0; fi
+  # nginx -T 输出全量配置，可能很大；这里只做轻量 grep
+  local cnt
+  cnt="$(nginx -T 2>/dev/null | grep -Eo "server_name\s+[^;]*" | grep -w "$domain" | wc -l | tr -d ' ')"
+  if [[ "${cnt:-0}" -gt 0 ]]; then
+    warn "检测到该域名可能已在现有 Nginx 配置中出现：$domain（次数：$cnt）"
+    warn "如果该域名已经被其他站点/脚本占用，本脚本再写同域名反代会产生冲突。"
+    read -rp "仍要继续为该域名创建本项目站点配置吗？(y/N): " yn
+    [[ "$yn" =~ ^[Yy]$ ]] || exit 1
+  fi
+}
+
 
 ensure_acme_root() {
   mkdir -p "$ACME_ROOT"
@@ -440,28 +453,21 @@ obtain_https_cert() {
   has_cmd certbot || { err "certbot 未安装"; exit 1; }
   ensure_acme_root
 
-  log "申请 Let's Encrypt 证书（仅作用于 ${domain}，不会覆盖其他站点）"
+  log "申请 Let's Encrypt 证书（安全模式：webroot，不改动任何其他站点配置）"
 
-  local has_nginx_plugin=0
-  if certbot plugins 2>/dev/null | grep -qE '^\s*nginx\b'; then
-    has_nginx_plugin=1
+  # webroot 申请证书：只需要 80 能访问 /.well-known/acme-challenge/
+  certbot certonly --webroot -w "$ACME_ROOT" -d "$domain" \
+    --non-interactive --agree-tos -m "$email" --keep-until-expiring
+
+  local site; site="$(nginx_site_path_for_domain "$domain")"
+  if [[ ! -f "$site" ]]; then
+    err "未找到站点配置：$site（请先生成 HTTP 反代配置）"
+    exit 1
   fi
 
-  if [[ "$has_nginx_plugin" -eq 1 ]]; then
-    certbot --nginx -d "$domain" --non-interactive --agree-tos -m "$email" --redirect
-  else
-    warn "未检测到 certbot nginx 插件，改用 webroot 方式申请证书（更安全、零侵入）"
-    certbot certonly --webroot -w "$ACME_ROOT" -d "$domain" \
-      --non-interactive --agree-tos -m "$email" --keep-until-expiring
-
-    local site; site="$(nginx_site_path_for_domain "$domain")"
-    if [[ ! -f "$site" ]]; then
-      err "未找到站点配置：$site（请先生成 HTTP 反代配置）"
-      exit 1
-    fi
-
-    if ! grep -q "listen 443" "$site"; then
-      cat >>"$site" <<EOF
+  # 仅追加/维护“本项目站点”的 443 配置，不碰其他 conf
+  if ! grep -q "listen 443" "$site"; then
+    cat >>"$site" <<EOF
 
 server {
   listen 443 ssl http2;
@@ -486,6 +492,18 @@ server {
   }
 }
 EOF
+  fi
+
+  nginx -t
+  if nginx_active; then
+    systemctl reload nginx
+  else
+    systemctl start nginx || true
+  fi
+  log "证书申请完成：${domain}"
+}
+
+EOF
     fi
   fi
 
@@ -508,7 +526,7 @@ setup_cert_renew() {
   fi
 
   if ! crontab -l 2>/dev/null | grep -q "certbot renew"; then
-    (crontab -l 2>/dev/null; echo "0 3 * * * certbot renew --quiet && (systemctl reload nginx || nginx -s reload || true)") | crontab -
+    (crontab -l 2>/dev/null; echo "0 3 * * * certbot renew --quiet --deploy-hook "systemctl reload nginx || nginx -s reload || true"") | crontab -
     log "已写入 cron 自动续期（每天 03:00）"
   fi
 }
@@ -521,6 +539,8 @@ https_enable_flow() {
 
   check_domain_points_to_local "$domain"
   ensure_nginx_certbot
+
+  scan_nginx_domain_conflict "$domain"
 
   # 写入仅针对该域名的 80 反代（不动 default / 不动其他站点）
   write_nginx_proxy_http_conf "$domain" "$PORT"
