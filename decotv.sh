@@ -9,7 +9,7 @@ export LC_ALL=C.UTF-8
 # - 可选：Docker Nginx + acme.sh(standalone) HTTPS 反代
 # - 反代：同 Docker 网络直连上游，避免 502（不走 127.0.0.1）
 # - 反代状态：显示是否启用 + 绑定域名 + 上游
-# - 脚本自更新：从 RAW 拉取覆盖当前脚本（支持 pipe 场景自动落盘）
+# - 脚本自更新：从 RAW 拉取覆盖当前脚本
 # ==========================================================
 
 APP="DecoTV"
@@ -32,14 +32,11 @@ NGX_IMG="nginx:latest"
 # Compose 网络名（强制 name: decotv-network，避免 compose 自动加前缀）
 NET="decotv-network"
 
-# ✅ 正式仓库 RAW（脚本自更新默认源）
-SCRIPT_URL_DEFAULT="https://raw.githubusercontent.com/li210724/bytv/main/decotv.sh"
+# 脚本自更新（改成你自己的 raw 地址）
+SCRIPT_URL_DEFAULT="https://raw.githubusercontent.com/ljp210724/bytv/main/decotv.sh"
 
-# ✅ 用于自更新校验（避免下错文件）
+# 用于自更新校验（避免下错文件）
 DECOTV_SCRIPT_MARK="DECOTV_SCRIPT_MARK_v1"
-
-# ✅ 固定落盘位置（解决 bash <(curl ...) 无法自更新）
-BIN_PATH="/usr/local/bin/decotv"
 
 # ------------------------------
 # 基础工具
@@ -68,9 +65,10 @@ inst_pkgs() {
 }
 
 ensure() {
+  # curl/ca/ss/socat/getent
   has curl || inst_pkgs curl ca-certificates
   has ss || inst_pkgs iproute2 || true
-  has getent || true
+  has getent || inst_pkgs libc-bin || true
   has socat || inst_pkgs socat || true
 
   if ! has docker; then
@@ -155,14 +153,15 @@ status_summary() {
   printf "%-14s | %-8s | %s\n" "$C2" "$(c_state "$C2")" "$(c_health "$C2")"
   printf "%-14s | %-8s | %s\n" "$NGX_C" "$(c_state "$NGX_C")" "$(c_ports "$NGX_C")"
   echo "------------------------------"
-  echo "访问地址：$(get_access_url)"
+
   if rp_enabled; then
-    echo "域名反代：已启用（${NGX_C}）"
+    echo "域名反代：已启用"
     echo "绑定域名：$(rp_domain)"
     echo "上游：$(rp_upstream)"
   else
     echo "域名反代：未启用"
   fi
+  echo "访问地址：$(get_access_url)"
 }
 
 # ------------------------------
@@ -238,11 +237,7 @@ deploy_done_output() {
 # ------------------------------
 domain_resolve_ip() {
   local d="$1"
-  if has getent; then
-    getent ahosts "$d" 2>/dev/null | awk '{print $1}' | head -n1 || true
-  else
-    echo ""
-  fi
+  getent ahosts "$d" 2>/dev/null | awk '{print $1}' | head -n1 || true
 }
 
 ensure_acme() {
@@ -350,6 +345,7 @@ ports_owned_by_our_nginx() {
 bind_domain_proxy() {
   installed || { echo "未安装，请先部署"; return; }
 
+  # 端口占用检查：不干预其他服务；若是我们自己的 nginx 占用则继续
   if (port_in_use 80 || port_in_use 443) && ! ports_owned_by_our_nginx; then
     echo "检测到 80/443 已被占用："
     port_in_use 80 && echo " - 80 端口占用（standalone 需要 80）"
@@ -383,6 +379,7 @@ bind_domain_proxy() {
   local rc=$?
   set -e
 
+  # 不把 Skipping 当失败：有本地证书就继续 install
   if [[ $rc -ne 0 ]]; then
     if has_local_cert "$domain"; then
       echo "检测到本地已有有效证书（可能是 Skipping），继续安装证书..."
@@ -395,6 +392,7 @@ bind_domain_proxy() {
 
   install_cert "$domain" || { echo "证书安装失败"; return; }
 
+  # 自动探测 core 内部端口
   local core_port upstream
   core_port="$(detect_core_internal_port)"
   upstream="${C1}:${core_port}"
@@ -402,6 +400,7 @@ bind_domain_proxy() {
   write_nginx_conf "$domain" "$core_port"
   run_nginx_container
 
+  # 写入反代信息
   sed -i '/^RP_DOMAIN=/d;/^RP_UPSTREAM=/d' "$ENVF" 2>/dev/null || true
   {
     echo "RP_DOMAIN=${domain}"
@@ -419,7 +418,7 @@ bind_domain_proxy() {
 }
 
 # ------------------------------
-# 更新镜像：不会删除 volume，不丢数据
+# 镜像更新说明：不会删除 volume，不会丢用户数据
 # ------------------------------
 update_images() {
   ensure
@@ -432,7 +431,7 @@ update_images() {
 }
 
 # ------------------------------
-# 脚本自更新（支持 pipe：自动安装到 /usr/local/bin/decotv）
+# 脚本自更新
 # ------------------------------
 script_path() {
   local p
@@ -441,14 +440,9 @@ script_path() {
   echo "$0"
 }
 
-is_pipe_path() {
-  local p="$1"
-  [[ "$p" == /proc/*/fd/* ]] || [[ "$p" == *"/fd/pipe:"* ]]
-}
-
 update_script_self() {
   ensure
-  local url path tmp oldperm target
+  local url path tmp oldperm
   url="$(kv SCRIPT_URL || true)"
   url="${url:-$SCRIPT_URL_DEFAULT}"
   path="$(script_path)"
@@ -463,6 +457,7 @@ update_script_self() {
     return
   fi
 
+  # 校验：shebang + 标记，避免覆盖成别的文件
   if ! head -n1 "$tmp" | grep -qE '^#!/usr/bin/env bash'; then
     rm -f "$tmp" || true
     echo "❌ 校验失败：不是 bash 脚本"
@@ -472,18 +467,6 @@ update_script_self() {
     rm -f "$tmp" || true
     echo "❌ 校验失败：更新源不是 DecoTV 脚本（标记不匹配）"
     echo "请确认 SCRIPT_URL / 默认 URL 指向正确的脚本 raw"
-    return
-  fi
-
-  # ✅ pipe 场景：无法覆盖自己，直接落盘到固定路径
-  if is_pipe_path "$path" || [[ ! -f "$path" ]]; then
-    target="$BIN_PATH"
-    echo "检测到 pipe 运行环境，无法原地更新：将写入 $target"
-    cp -f "$tmp" "$target"
-    chmod +x "$target" || true
-    rm -f "$tmp" || true
-    echo "✅ 脚本已安装/更新完成：$target"
-    echo "请改用命令运行：$target"
     return
   fi
 
@@ -535,6 +518,15 @@ do_deploy() {
 show_status() {
   ensure
   installed || { echo "未安装"; return; }
+  echo "运行状态：$(running_state)"
+  echo "访问地址：$(get_access_url)"
+  if rp_enabled; then
+    echo "域名反代：已启用（${NGX_C}）"
+    echo "绑定域名：$(rp_domain)"
+    echo "上游：$(rp_upstream)"
+  else
+    echo "域名反代：未启用/未运行"
+  fi
   status_summary
   echo "账号：$(kv USERNAME)"
   read -r -p "是否显示密码？(y/n) [n]：" a
@@ -604,12 +596,9 @@ menu() {
   echo "=============================="
   echo " ${APP} · 交互式管理面板"
   echo "=============================="
-  echo "当前状态：$(running_state)"
-  echo "访问地址：$(get_access_url)"
+  echo "当前状态：$(running_state) ｜ 访问：$(get_access_url)"
   if rp_enabled; then
-    echo "域名反代：已启用（${NGX_C}）"
-    echo "域名：$(rp_domain)"
-    echo "上游：$(rp_upstream)"
+    echo "域名反代：已启用（${NGX_C}）｜ 域名：$(rp_domain) ｜ 上游：$(rp_upstream)"
   else
     echo "域名反代：未启用"
   fi
