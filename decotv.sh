@@ -4,6 +4,8 @@ export LANG=C.UTF-8 LC_ALL=C.UTF-8
 
 APP="DecoTV"
 DIR="/opt/decotv"; ENVF="$DIR/.env"; YML="$DIR/docker-compose.yml"
+C1="decotv-core"; C2="decotv-kvrocks"
+IMG1="ghcr.io/decohererk/decotv:latest"; IMG2="apache/kvrocks:latest"
 
 need_root(){ [[ "${EUID:-$(id -u)}" -eq 0 ]] || { echo "请用 root 运行（sudo -i）"; exit 1; }; }
 has(){ command -v "$1" >/dev/null 2>&1; }
@@ -11,6 +13,7 @@ pm(){ has apt-get&&echo apt||has dnf&&echo dnf||has yum&&echo yum||has pacman&&e
 pause(){ read -r -p "按回车继续..." _ || true; }
 installed(){ [[ -f "$ENVF" && -f "$YML" ]]; }
 compose(){ (cd "$DIR" && docker compose --env-file "$ENVF" "$@"); }
+kv(){ grep -E "^$1=" "$ENVF" 2>/dev/null | head -n1 | cut -d= -f2- || true; }
 
 inst_pkgs(){
   local m; m="$(pm)"
@@ -44,21 +47,34 @@ pick_port(){
   while :; do x="$(shuf -i 20000-60000 -n 1 2>/dev/null || echo 3000)"; ! inuse "$x" && { echo "$x"; return; }; done
 }
 
-kv(){ grep -E "^$1=" "$ENVF" 2>/dev/null | head -n1 | cut -d= -f2- || true; }
-
 访问地址(){
-  if ! installed; then echo "未安装"; return; fi
-  local p u host
-  p="$(kv APP_PORT)"; u="$(kv USERNAME)"
+  installed || { echo "未安装"; return; }
+  local host p
   host="$(ip || true)"; [[ -z "${host:-}" ]] && host="<服务器IP>"
-  echo "http://${host}:${p:-?}（账号：${u:-?}）"
+  p="$(kv APP_PORT)"
+  echo "http://${host}:${p:-?}"
 }
 
 运行状态(){
-  if ! installed; then echo "未安装"; return; fi
+  installed || { echo "未安装"; return; }
   local n
   n="$(compose ps --status running 2>/dev/null | awk 'NR>1{print $1}' | wc -l | tr -d ' ')"
   [[ "$n" == "2" ]] && echo "运行中" || echo "未完全运行"
+}
+
+c_state(){ docker inspect -f '{{.State.Status}}' "$1" 2>/dev/null || echo "不存在"; }
+c_health(){ docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}无健康检查{{end}}' "$1" 2>/dev/null || echo "-"; }
+c_ports(){ docker port "$1" 2>/dev/null | head -n1 | tr -d '\r' || echo "-"; }
+
+状态摘要(){
+  echo "------------------------------"
+  echo "服务状态（紧凑版）"
+  echo "------------------------------"
+  printf "%-12s | %-8s | %s\n" "容器" "状态" "端口/健康"
+  echo "------------------------------"
+  printf "%-12s | %-8s | %s\n" "$C1" "$(c_state "$C1")" "$(c_ports "$C1")"
+  printf "%-12s | %-8s | %s\n" "$C2" "$(c_state "$C2")" "$(c_health "$C2")"
+  echo "------------------------------"
 }
 
 write_cfg(){
@@ -94,6 +110,42 @@ volumes: { kvrocks-data: {} }
 EOF
 }
 
+安装快捷指令(){
+  # 优先 /usr/local/bin，其次 /usr/bin（兼容你之前的习惯）
+  local target=""
+  if [[ -d /usr/local/bin && -w /usr/local/bin ]]; then
+    target="/usr/local/bin/decotv"
+  else
+    target="/usr/bin/decotv"
+  fi
+
+  # 复制自身到目标（避免软链接在 curl|bash 场景找不到原文件）
+  cp -f "$0" "$target"
+  chmod +x "$target"
+  echo "快捷指令已创建：decotv  （路径：$target）"
+}
+
+部署完成输出(){
+  local host p user pass
+  host="$(ip || true)"; [[ -z "${host:-}" ]] && host="<服务器IP>"
+  p="$(kv APP_PORT)"; user="$(kv USERNAME)"; pass="$(kv PASSWORD)"
+  echo
+  echo "=============================="
+  echo " DecoTV 部署完成"
+  echo "=============================="
+  echo "访问地址：http://${host}:${p}"
+  echo "端口映射：${p}:3000"
+  echo "账号：${user}"
+  echo "密码：${pass}"
+  echo
+  echo "快捷指令：decotv"
+  echo "常用命令："
+  echo "  日志：docker logs -f --tail=200 ${C1}"
+  echo "  更新：decotv -> 更新"
+  echo "  卸载：decotv -> 卸载"
+  echo
+}
+
 部署(){
   ensure
   if installed; then
@@ -109,67 +161,81 @@ EOF
     [[ "$p1" == "$p2" ]] || { echo "两次密码不一致"; continue; }
     break
   done
+
   read -r -p "外部访问端口 [3000]：" pp; pp="${pp:-3000}"
   port="$(pick_port "$pp")"
   [[ "$port" != "$pp" ]] && echo "端口 $pp 已占用，自动选用：$port"
 
   write_cfg "$port" "$user" "$p1"
   compose up -d
-  echo "部署完成：$(访问地址)"
+  安装快捷指令
+  状态摘要
+  部署完成输出
 }
 
 更新(){
   ensure; installed || { echo "未安装，请先部署"; return; }
-  compose pull
-  compose up -d
+  compose pull; compose up -d
   echo "更新完成：$(访问地址)"
+  状态摘要
 }
 
 状态(){
   ensure; installed || { echo "未安装"; return; }
-  compose ps || true
   echo "运行状态：$(运行状态)"
   echo "访问地址：$(访问地址)"
-  echo "密码：$(kv PASSWORD)"
+  状态摘要
+  echo "账号：$(kv USERNAME)"
+  read -r -p "是否显示密码？(y/n) [n]：" a
+  [[ "${a:-n}" == "y" ]] && echo "密码：$(kv PASSWORD)"
 }
 
 日志(){
   ensure; installed || { echo "未安装"; return; }
-  echo "提示：按 Ctrl+C 退出日志"
-  compose logs -f --tail=200
+  echo "1) 核心(core)日志"
+  echo "2) 数据库(kvrocks)日志"
+  echo "0) 返回"
+  read -r -p "请选择 [0-2]：" c
+  case "${c:-}" in
+    1) echo "提示：按 Ctrl+C 退出日志"; docker logs -f --tail=200 "$C1" ;;
+    2) echo "提示：按 Ctrl+C 退出日志"; docker logs -f --tail=200 "$C2" ;;
+    0) return ;;
+    *) echo "无效选择" ;;
+  esac
 }
 
 卸载(){
   ensure
-  read -r -p "确认卸载（容器+卷+网络+目录）？(y/n) [n]：" a
+  echo "将执行：停止并删除容器/卷/网络/目录，并尝试删除镜像；最后删除脚本本体。"
+  read -r -p "确认卸载？(y/n) [n]：" a
   [[ "${a:-n}" == "y" ]] || { echo "已取消"; return; }
 
   if installed; then
     (cd "$DIR" && docker compose --env-file "$ENVF" down -v --remove-orphans) || true
-  else
-    docker rm -f decotv-core >/dev/null 2>&1 || true
-    docker rm -f decotv-kvrocks >/dev/null 2>&1 || true
   fi
+  docker rm -f "$C1" >/dev/null 2>&1 || true
+  docker rm -f "$C2" >/dev/null 2>&1 || true
   docker network rm decotv-network >/dev/null 2>&1 || true
   docker volume rm kvrocks-data >/dev/null 2>&1 || true
-
-  read -r -p "是否删除镜像（释放空间）？(y/n) [y]：" b
-  if [[ "${b:-y}" == "y" ]]; then
-    docker rmi -f ghcr.io/decohererk/decotv:latest >/dev/null 2>&1 || true
-    docker rmi -f apache/kvrocks:latest >/dev/null 2>&1 || true
-  fi
-
+  docker rmi -f "$IMG1" >/dev/null 2>&1 || true
+  docker rmi -f "$IMG2" >/dev/null 2>&1 || true
   rm -rf "$DIR" || true
-  echo "卸载完成"
+  rm -f /usr/local/bin/decotv /usr/bin/decotv >/dev/null 2>&1 || true
+
+  echo "卸载完成，即将删除脚本本体并退出。"
+
+  # 自删：脚本结束后删自身（避免正在执行时出问题）
+  ( sleep 1; rm -f "$0" >/dev/null 2>&1 || true ) &
+  exit 0
 }
 
 清理(){
   ensure
   echo "仅清理未使用资源：停止容器/悬空镜像/未使用网络/未使用卷"
-  read -r -p "确认执行 Docker 清理？(y/n) [n]：" a
+  read -r -p "确认清理？(y/n) [n]：" a
   [[ "${a:-n}" == "y" ]] || { echo "已取消"; return; }
-  docker system prune -f || true
-  docker volume prune -f || true
+  docker system prune -f >/dev/null 2>&1 || true
+  docker volume prune -f >/dev/null 2>&1 || true
   echo "清理完成"
 }
 
@@ -182,9 +248,9 @@ EOF
   echo
   echo "1) 部署 / 重装"
   echo "2) 更新（拉取最新镜像）"
-  echo "3) 状态（查看信息/密码）"
+  echo "3) 状态（查看信息）"
   echo "4) 日志（实时跟踪）"
-  echo "5) 卸载（尽量彻底）"
+  echo "5) 卸载（彻底删除）"
   echo "6) 清理（Docker 垃圾清理）"
   echo "0) 退出"
   echo
@@ -200,7 +266,7 @@ main(){
       2) 更新; pause ;;
       3) 状态; pause ;;
       4) 日志 ;;
-      5) 卸载; pause ;;
+      5) 卸载 ;;   # 卸载会 exit，不需要 pause
       6) 清理; pause ;;
       0) exit 0 ;;
       *) echo "无效选择"; pause ;;
