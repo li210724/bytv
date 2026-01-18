@@ -4,9 +4,17 @@ export LANG=C.UTF-8
 export LC_ALL=C.UTF-8
 
 # =======================
-# DecoTV Smart One-Click
-# - Non-invasive, repeatable, auto-degrade
-# - Docker + optional Nginx reverse proxy + optional HTTPS(webroot)
+# DecoTV Smart One-Click (容器域名绑定方案 - TechLion风格)
+# - 反代用 docker 内置 nginx 容器（decotv-proxy），不依赖系统 nginx
+# - 域名绑定通过 docker network：proxy_pass http://decotv-core:3000
+# - 可重复执行：down --remove-orphans + 清理旧固定名容器
+# - 尽量不冲突：80/443 不可用自动换端口；失败自动降级为直连端口
+# - 密码两次确认；安装后明文显示一次
+# - 更新镜像：pull latest + 重建
+# - 域名解析提示：是否指向本机
+# - 服务探测：多路径等待
+# - HTTPS(可选)：acme.sh + webroot（推荐用 80/443；不通则自动降级）
+# - 关键增强：PASSWORD 注入校验（容器内校验，不通过则自动重建一次）
 # =======================
 
 APP_DIR="/opt/decotv"
@@ -14,18 +22,24 @@ COMPOSE_FILE="$APP_DIR/docker-compose.yml"
 ENV_FILE="$APP_DIR/.env"
 PROJECT_NAME="decotv"
 
+# images
 IMAGE_CORE="ghcr.io/decohererk/decotv:latest"
 IMAGE_KVROCKS="apache/kvrocks:latest"
+IMAGE_PROXY="nginx:alpine"
+
 CONTAINER_PORT="3000"
 
+# ports
 DEFAULT_HOST_PORT="3000"
-PROXY_PORTS=(80 8080 8880 9080 10080)
+HTTP_PORTS=(80 8080 8880 9080 10080)
+HTTPS_PORTS=(443 8443 9443 10443)
 
-NGINX_CONF_DIR="/etc/nginx/conf.d"
-NGINX_CONF_FILE="$NGINX_CONF_DIR/decotv.conf"
-ACME_WEBROOT="/var/www/decotv-acme"
+# proxy files
+PROXY_DIR="$APP_DIR/proxy"
+PROXY_CONF="$PROXY_DIR/decotv.conf"
+PROXY_WEBROOT="$PROXY_DIR/www"   # acme webroot
+PROXY_CERTS="$PROXY_DIR/certs"   # mounted certs
 
-# ----- output (no color -> avoid "乱码" in some terminals/files) -----
 log(){  echo "[+] $*"; }
 warn(){ echo "[!] $*"; }
 err(){  echo "[-] $*" >&2; }
@@ -75,7 +89,6 @@ ensure_base(){
   have sed || miss+=(sed)
   have grep || miss+=(grep)
   have ss || miss+=(iproute2)
-  have getent || true
   if ((${#miss[@]})); then
     warn "安装依赖：${miss[*]}"
     pm_install "${miss[@]}" || true
@@ -158,7 +171,7 @@ domain_dns_hint(){
     log "域名解析检查：${domain} 已指向本机 IP（${myip}）"
   else
     warn "域名解析检查：${domain} 解析为 [${ips}]，本机 IP 是 [${myip}]"
-    warn "如果要域名访问，请确认 DNS A/AAAA 指向本机。"
+    warn "如需域名访问，请确认 DNS A/AAAA 指向本机。"
   fi
 }
 
@@ -198,40 +211,6 @@ compose(){
   fi
 }
 
-write_compose(){
-  local host_port="$1"
-  mkdir -p "$APP_DIR"
-  # 关键：不写 container_name，杜绝重名冲突
-  cat >"$COMPOSE_FILE" <<EOF
-services:
-  decotv-core:
-    image: ${IMAGE_CORE}
-    restart: on-failure
-    ports:
-      - '${host_port}:${CONTAINER_PORT}'
-    env_file: [./.env]
-    environment:
-      - NEXT_PUBLIC_STORAGE_TYPE=kvrocks
-      - KVROCKS_URL=redis://decotv-kvrocks:6666
-    networks: [decotv-network]
-    depends_on: [decotv-kvrocks]
-
-  decotv-kvrocks:
-    image: ${IMAGE_KVROCKS}
-    restart: unless-stopped
-    volumes:
-      - kvrocks-data:/var/lib/kvrocks
-    networks: [decotv-network]
-
-networks:
-  decotv-network:
-    driver: bridge
-
-volumes:
-  kvrocks-data:
-EOF
-}
-
 write_env(){
   local u="$1" p="$2" base="$3"
   cat >"$ENV_FILE" <<EOF
@@ -248,8 +227,8 @@ cleanup_project(){
     warn "清理本项目残留（down --remove-orphans）..."
     compose down --remove-orphans >/dev/null 2>&1 || true
   fi
-  # 防御：旧脚本可能写死 container_name 造成占用
-  for cn in decotv-core decotv-kvrocks; do
+  # 防御：旧脚本可能写死 container_name
+  for cn in decotv-core decotv-kvrocks decotv-proxy; do
     if docker ps -a --format '{{.Names}}' | grep -qx "$cn"; then
       warn "发现旧固定名容器占用：$cn，自动移除..."
       docker rm -f "$cn" >/dev/null 2>&1 || true
@@ -257,64 +236,34 @@ cleanup_project(){
   done
 }
 
-ensure_nginx(){
-  if have nginx; then
-    log "Nginx 已存在：$(nginx -v 2>&1 || true)"
-  else
-    warn "安装 Nginx（仅用于本项目反代，不覆盖其它站点）..."
-    pm_install nginx
-  fi
-
-  mkdir -p "$NGINX_CONF_DIR" "$ACME_WEBROOT"
-  systemctl enable nginx >/dev/null 2>&1 || true
-
-  if ! systemctl is-active --quiet nginx 2>/dev/null; then
-    warn "Nginx 未运行，尝试启动..."
-    if ! systemctl start nginx >/dev/null 2>&1; then
-      warn "Nginx 启动失败：跳过反代（不影响 Docker 服务）"
-      warn "排查：systemctl status nginx --no-pager && journalctl -xeu nginx --no-pager | tail -n 120"
-      return 1
-    fi
-  fi
-  return 0
+detect_core_container(){
+  docker ps --format '{{.Names}}' | grep -E "^${PROJECT_NAME}.*core" | head -n1 || true
 }
 
-nginx_apply_or_degrade(){
-  # nginx -t 成功才 reload/restart
-  if ! nginx -t >/dev/null 2>&1; then
-    warn "Nginx 配置测试失败，移除本项目配置并降级"
-    rm -f "$NGINX_CONF_FILE" >/dev/null 2>&1 || true
-    return 1
-  fi
-
-  if systemctl is-active --quiet nginx 2>/dev/null; then
-    systemctl reload nginx >/dev/null 2>&1 || systemctl restart nginx >/dev/null 2>&1 || return 1
-  else
-    systemctl restart nginx >/dev/null 2>&1 || return 1
-  fi
-  return 0
+assert_password_in_container(){
+  local core="$1"
+  [[ -n "$core" ]] || return 1
+  local ok=""
+  ok="$(docker exec "$core" sh -lc '[ -n "${PASSWORD:-}" ] && echo OK || echo NO' 2>/dev/null || true)"
+  [[ "$ok" == "OK" ]]
 }
 
-write_nginx_http_conf(){
-  local domain="$1" listen_port="$2" upstream_port="$3"
-  cat >"$NGINX_CONF_FILE" <<EOF
-# DecoTV reverse proxy (generated, non-invasive)
+write_proxy_http_conf(){
+  local domain="$1" http_port="$2"
+  mkdir -p "$PROXY_DIR" "$PROXY_WEBROOT" "$PROXY_CERTS"
+  cat >"$PROXY_CONF" <<EOF
 server {
-  listen ${listen_port};
-  listen [::]:${listen_port};
+  listen 80;
   server_name ${domain};
 
-  # ACME webroot (only for this project)
   location ^~ /.well-known/acme-challenge/ {
-    root ${ACME_WEBROOT};
+    root /var/www/html;
     default_type "text/plain";
     try_files \$uri =404;
   }
 
-  client_max_body_size 64m;
-
   location / {
-    proxy_pass http://127.0.0.1:${upstream_port};
+    proxy_pass http://decotv-core:${CONTAINER_PORT};
     proxy_http_version 1.1;
     proxy_set_header Host \$host;
     proxy_set_header X-Real-IP \$remote_addr;
@@ -325,42 +274,36 @@ server {
   }
 }
 EOF
+  # 注意：proxy 容器内部永远监听 80；宿主机用映射端口 http_port
+  : > /dev/null
 }
 
-write_nginx_https_conf(){
-  local domain="$1" upstream_port="$2" cert="$3" key="$4"
-  # HTTPS server + HTTP redirect (still only this project)
-  cat >"$NGINX_CONF_FILE" <<EOF
-# DecoTV reverse proxy (generated, non-invasive)
-
+write_proxy_https_conf(){
+  local domain="$1" cert="$2" key="$3"
+  mkdir -p "$PROXY_DIR" "$PROXY_WEBROOT" "$PROXY_CERTS"
+  cat >"$PROXY_CONF" <<EOF
 server {
   listen 80;
-  listen [::]:80;
   server_name ${domain};
 
   location ^~ /.well-known/acme-challenge/ {
-    root ${ACME_WEBROOT};
+    root /var/www/html;
     default_type "text/plain";
     try_files \$uri =404;
   }
 
-  location / {
-    return 301 https://\$host\$request_uri;
-  }
+  location / { return 301 https://\$host\$request_uri; }
 }
 
 server {
   listen 443 ssl http2;
-  listen [::]:443 ssl http2;
   server_name ${domain};
 
-  ssl_certificate     ${cert};
-  ssl_certificate_key ${key};
-
-  client_max_body_size 64m;
+  ssl_certificate     /etc/nginx/certs/${domain}.crt;
+  ssl_certificate_key /etc/nginx/certs/${domain}.key;
 
   location / {
-    proxy_pass http://127.0.0.1:${upstream_port};
+    proxy_pass http://decotv-core:${CONTAINER_PORT};
     proxy_http_version 1.1;
     proxy_set_header Host \$host;
     proxy_set_header X-Real-IP \$remote_addr;
@@ -371,11 +314,13 @@ server {
   }
 }
 EOF
+
+  cp -f "$cert" "$PROXY_CERTS/${domain}.crt"
+  cp -f "$key"  "$PROXY_CERTS/${domain}.key"
 }
 
 ensure_acmesh(){
-  if have ~/.acme.sh/acme.sh; then return 0; fi
-  if have acme.sh; then return 0; fi
+  if [[ -x "${HOME}/.acme.sh/acme.sh" ]] || have acme.sh; then return 0; fi
   warn "安装 acme.sh（仅用于本项目 HTTPS，webroot 非侵入）..."
   curl -fsSL https://get.acme.sh | sh >/dev/null 2>&1 || return 1
   return 0
@@ -384,44 +329,28 @@ ensure_acmesh(){
 issue_https_webroot(){
   local domain="$1"
   local acme="${HOME}/.acme.sh/acme.sh"
-  if ! [[ -x "$acme" ]]; then
-    # fallback
-    acme="$(command -v acme.sh 2>/dev/null || true)"
-  fi
+  [[ -x "$acme" ]] || acme="$(command -v acme.sh 2>/dev/null || true)"
   [[ -n "${acme:-}" ]] || return 1
-
-  mkdir -p "$ACME_WEBROOT/.well-known/acme-challenge"
-
-  # 使用 webroot 验证（非侵入，不停别的站）
-  "$acme" --issue -d "$domain" --webroot "$ACME_WEBROOT" --keylength ec-256 >/dev/null 2>&1 \
-    || "$acme" --issue -d "$domain" --webroot "$ACME_WEBROOT" >/dev/null 2>&1 \
+  mkdir -p "$PROXY_WEBROOT/.well-known/acme-challenge"
+  "$acme" --issue -d "$domain" --webroot "$PROXY_WEBROOT" --keylength ec-256 >/dev/null 2>&1 \
+    || "$acme" --issue -d "$domain" --webroot "$PROXY_WEBROOT" >/dev/null 2>&1 \
     || return 1
-
   return 0
 }
 
-install_https_files(){
+export_https_files(){
   local domain="$1"
   local acme="${HOME}/.acme.sh/acme.sh"
-  if ! [[ -x "$acme" ]]; then
-    acme="$(command -v acme.sh 2>/dev/null || true)"
-  fi
+  [[ -x "$acme" ]] || acme="$(command -v acme.sh 2>/dev/null || true)"
   [[ -n "${acme:-}" ]] || return 1
 
-  local outdir="/etc/ssl/decotv"
+  local outdir="$PROXY_DIR/_acme_out"
   mkdir -p "$outdir"
   local cert="${outdir}/${domain}.crt"
   local key="${outdir}/${domain}.key"
 
-  "$acme" --install-cert -d "$domain" \
-    --ecc \
-    --key-file "$key" \
-    --fullchain-file "$cert" \
-    --reloadcmd "systemctl reload nginx || systemctl restart nginx" >/dev/null 2>&1 \
-    || "$acme" --install-cert -d "$domain" \
-      --key-file "$key" \
-      --fullchain-file "$cert" \
-      --reloadcmd "systemctl reload nginx || systemctl restart nginx" >/dev/null 2>&1 \
+  "$acme" --install-cert -d "$domain" --ecc --key-file "$key" --fullchain-file "$cert" >/dev/null 2>&1 \
+    || "$acme" --install-cert -d "$domain" --key-file "$key" --fullchain-file "$cert" >/dev/null 2>&1 \
     || return 1
 
   echo "${cert}|${key}"
@@ -432,8 +361,7 @@ wait_ready(){
   have curl || return 0
   local base="http://127.0.0.1:${port}"
   local paths=("/" "/login" "/api" "/api/health" "/health" "/healthz")
-  local i=0
-
+  local i
   log "服务探测：等待服务可用..."
   for ((i=0;i<20;i++)); do
     local p
@@ -449,6 +377,100 @@ wait_ready(){
   return 0
 }
 
+write_compose(){
+  local host_port="$1"
+  local enable_proxy="$2"   # 0/1
+  local http_port="$3"      # host http mapped port
+  local enable_https="$4"   # 0/1
+  local https_port="$5"     # host https mapped port
+
+  mkdir -p "$APP_DIR" "$PROXY_DIR" "$PROXY_WEBROOT" "$PROXY_CERTS"
+
+  if [[ "$enable_proxy" == "1" ]]; then
+    # 有域名反代时：core 不强制暴露宿主端口（避免冲突）
+    cat >"$COMPOSE_FILE" <<EOF
+services:
+  decotv-core:
+    image: ${IMAGE_CORE}
+    restart: on-failure
+    env_file: [./.env]
+    environment:
+      - USERNAME=\${USERNAME}
+      - PASSWORD=\${PASSWORD}
+      - SITE_BASE=\${SITE_BASE}
+      - NEXT_PUBLIC_STORAGE_TYPE=kvrocks
+      - KVROCKS_URL=redis://decotv-kvrocks:6666
+    expose: ['${CONTAINER_PORT}']
+    networks: [decotv-network]
+    depends_on: [decotv-kvrocks]
+
+  decotv-kvrocks:
+    image: ${IMAGE_KVROCKS}
+    restart: unless-stopped
+    volumes: [kvrocks-data:/var/lib/kvrocks]
+    networks: [decotv-network]
+
+  decotv-proxy:
+    image: ${IMAGE_PROXY}
+    restart: unless-stopped
+    ports:
+      - '${http_port}:80'
+EOF
+
+    if [[ "$enable_https" == "1" ]]; then
+      cat >>"$COMPOSE_FILE" <<EOF
+      - '${https_port}:443'
+EOF
+    fi
+
+    cat >>"$COMPOSE_FILE" <<EOF
+    volumes:
+      - ./proxy/decotv.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./proxy/www:/var/www/html:ro
+      - ./proxy/certs:/etc/nginx/certs:ro
+    networks: [decotv-network]
+    depends_on: [decotv-core]
+
+networks:
+  decotv-network: { driver: bridge }
+
+volumes:
+  kvrocks-data: {}
+EOF
+
+  else
+    # 无域名反代：对外直接暴露 host_port
+    cat >"$COMPOSE_FILE" <<EOF
+services:
+  decotv-core:
+    image: ${IMAGE_CORE}
+    restart: on-failure
+    ports: ['${host_port}:${CONTAINER_PORT}']
+    env_file: [./.env]
+    environment:
+      - USERNAME=\${USERNAME}
+      - PASSWORD=\${PASSWORD}
+      - SITE_BASE=\${SITE_BASE}
+      - NEXT_PUBLIC_STORAGE_TYPE=kvrocks
+      - KVROCKS_URL=redis://decotv-kvrocks:6666
+    networks: [decotv-network]
+    depends_on: [decotv-kvrocks]
+
+  decotv-kvrocks:
+    image: ${IMAGE_KVROCKS}
+    restart: unless-stopped
+    volumes: [kvrocks-data:/var/lib/kvrocks]
+    networks: [decotv-network]
+
+networks:
+  decotv-network: { driver: bridge }
+
+volumes:
+  kvrocks-data: {}
+EOF
+  fi
+}
+
 install_shortcut(){
   local bin="/usr/local/bin/decotv"
   cat >"$bin" <<EOF
@@ -460,23 +482,41 @@ EOF
 }
 
 show_access(){
-  local user="$1" pass="$2" host_port="$3" domain="${4:-}" proxy_port="${5:-}" https="${6:-0}"
-  local ip; ip="$(public_ip)"
+  local user="$1" pass="$2"
+  local host_port="$3"
+  local domain="${4:-}"
+  local http_port="${5:-}"
+  local https_on="${6:-0}"
+  local https_port="${7:-}"
 
+  local ip; ip="$(public_ip)"
   echo
   echo "=============================="
   echo " DecoTV 部署完成"
   echo "=============================="
   echo "管理员账号: ${user}"
   echo "管理员密码: ${pass}"
-  echo "Docker 端口 : ${host_port}"
-  if [[ "$https" == "1" && -n "$domain" ]]; then
-    echo "访问地址(HTTPS): https://${domain}"
-  elif [[ -n "$domain" && -n "$proxy_port" ]]; then
-    [[ "$proxy_port" == "80" ]] && echo "访问地址(域名): http://${domain}" || echo "访问地址(域名): http://${domain}:${proxy_port}"
+
+  if [[ -n "$domain" ]]; then
+    if [[ "$https_on" == "1" ]]; then
+      if [[ "$https_port" == "443" ]]; then
+        echo "访问地址(HTTPS): https://${domain}"
+      else
+        echo "访问地址(HTTPS): https://${domain}:${https_port}"
+      fi
+    else
+      if [[ "$http_port" == "80" ]]; then
+        echo "访问地址(域名): http://${domain}"
+      else
+        echo "访问地址(域名): http://${domain}:${http_port}"
+      fi
+    fi
+    echo "说明：域名反代由 docker 容器 decotv-proxy 提供（更稳，不依赖系统 nginx）"
   else
+    echo "Docker 端口 : ${host_port}"
     echo "访问地址(IP):   http://${ip}:${host_port}"
   fi
+
   echo "安装目录: ${APP_DIR}"
   echo
 }
@@ -487,99 +527,124 @@ do_install(){
   ensure_compose
 
   local host_port user pass domain
-  host_port="$(prompt_port "请输入 DecoTV 对外端口 " "$DEFAULT_HOST_PORT")"
-  port_in_use "$host_port" && die "端口 ${host_port} 已被占用，请换一个端口。"
+  host_port="$(prompt_port "请输入 DecoTV 对外端口（无域名反代时使用）" "$DEFAULT_HOST_PORT")"
+  port_in_use "$host_port" && warn "端口 ${host_port} 已被占用（如果你启用域名反代，将不会用到这个端口）"
 
   user="$(prompt_nonempty "请输入管理员用户名: ")"
   pass="$(prompt_password_confirm)"
 
-  read -r -p "如需启用 Nginx 反代，请输入绑定域名（留空则不启用）: " domain
+  read -r -p "如需启用 域名反代(容器Nginx)，请输入绑定域名（留空则不启用）: " domain
   domain="$(trim "$domain")"
 
   mkdir -p "$APP_DIR"
   cp -f "$0" "${APP_DIR}/decotv.sh" >/dev/null 2>&1 || true
   chmod +x "${APP_DIR}/decotv.sh" >/dev/null 2>&1 || true
 
-  write_compose "$host_port"
-  write_env "$user" "$pass" ""
-
   cleanup_project
 
-  log "启动容器..."
+  local enable_proxy="0" http_port="" enable_https="0" https_port="" site_base=""
+
+  if [[ -n "$domain" ]]; then
+    enable_proxy="1"
+    domain_dns_hint "$domain" || true
+
+    http_port="$(pick_free_port "${HTTP_PORTS[@]}")"
+    [[ -n "$http_port" ]] || { warn "找不到可用 HTTP 端口（80/8080/8880/9080/10080），将降级为直连端口"; enable_proxy="0"; }
+  fi
+
+  if [[ "$enable_proxy" == "1" ]]; then
+    # 先生成 HTTP 反代配置（容器内监听 80，宿主机映射 http_port）
+    write_proxy_http_conf "$domain" "$http_port"
+    site_base="http://${domain}"
+    [[ "$http_port" != "80" ]] && site_base="http://${domain}:${http_port}"
+    write_env "$user" "$pass" "$site_base"
+    write_compose "$host_port" "1" "$http_port" "0" "0"
+
+    log "启动容器（含 decotv-proxy）..."
+    compose up -d
+    log "容器已启动"
+
+    # PASSWORD 注入校验
+    local core=""; core="$(detect_core_container)"
+    if [[ -n "$core" ]] && ! assert_password_in_container "$core"; then
+      warn "检测到容器内未读到 PASSWORD（会触发安全合规警告），自动重建一次..."
+      compose down --remove-orphans >/dev/null 2>&1 || true
+      compose up -d
+      sleep 1
+      core="$(detect_core_container)"
+      if [[ -n "$core" ]] && assert_password_in_container "$core"; then
+        log "PASSWORD 注入修复成功"
+      else
+        warn "仍未确认 PASSWORD 注入成功：请检查 ${ENV_FILE}"
+      fi
+    else
+      log "PASSWORD 注入检查通过"
+    fi
+
+    # 可选 HTTPS：只有当 http_port==80 或者你愿意映射 80 给 proxy 才更稳
+    if [[ "$http_port" == "80" ]]; then
+      local yn=""
+      read -r -p "是否为该域名启用 HTTPS（Let’s Encrypt/webroot，非侵入）？(y/N): " yn
+      yn="$(trim "${yn:-N}")"
+      if [[ "$yn" == "y" || "$yn" == "Y" ]]; then
+        https_port="$(pick_free_port "${HTTPS_PORTS[@]}")"
+        if [[ -z "$https_port" ]]; then
+          warn "找不到可用 HTTPS 端口（443/8443/9443/10443），跳过 HTTPS"
+        else
+          ensure_acmesh || warn "acme.sh 安装失败，跳过 HTTPS"
+          if issue_https_webroot "$domain"; then
+            local ck; ck="$(export_https_files "$domain" || true)"
+            if [[ -n "$ck" ]]; then
+              local cert="${ck%%|*}" key="${ck#*|}"
+              write_proxy_https_conf "$domain" "$cert" "$key"
+              enable_https="1"
+              site_base="https://${domain}"
+              [[ "$https_port" != "443" ]] && site_base="https://${domain}:${https_port}"
+              write_env "$user" "$pass" "$site_base"
+
+              # 重新写 compose：把 443(容器) 映射到宿主 https_port
+              write_compose "$host_port" "1" "$http_port" "1" "$https_port"
+              compose up -d
+              log "HTTPS 已启用：$site_base"
+            else
+              warn "证书导出失败，保持 HTTP 不变"
+            fi
+          else
+            warn "证书签发失败（常见：域名未指向本机/80 不通/防火墙拦截），保持 HTTP 不变"
+          fi
+        fi
+      fi
+    else
+      warn "提示：当前 HTTP 端口不是 80（而是 ${http_port}），Let’s Encrypt HTTP-01 自动签发成功率会很低。"
+      warn "建议：让 80 可用再启用 HTTPS，或后续扩展 DNS 验证。"
+    fi
+
+    install_shortcut || true
+    show_access "$user" "$pass" "$host_port" "$domain" "$http_port" "$enable_https" "$https_port"
+    return 0
+  fi
+
+  # 降级：无域名反代（直连端口）
+  write_env "$user" "$pass" ""
+  write_compose "$host_port" "0" "0" "0" "0"
+  log "启动容器（直连端口）..."
   compose up -d
   log "容器已启动"
   wait_ready "$host_port" || true
 
-  local proxy_port="" https_enabled="0"
-
-  if [[ -n "$domain" ]]; then
-    domain_dns_hint "$domain" || true
-
-    if ensure_nginx; then
-      proxy_port="$(pick_free_port "${PROXY_PORTS[@]}")"
-      if [[ -z "$proxy_port" ]]; then
-        warn "未找到可用反代端口（80/8080/8880/9080/10080 全占用），跳过反代。"
-        domain=""
-      else
-        [[ "$proxy_port" != "80" ]] && warn "为避免冲突，本项目反代端口使用：${proxy_port}"
-
-        # 先上 HTTP 反代（无论是否后续 HTTPS）
-        write_nginx_http_conf "$domain" "$proxy_port" "$host_port"
-        if nginx_apply_or_degrade; then
-          log "HTTP 反代已生效：${NGINX_CONF_FILE}"
-          [[ "$proxy_port" == "80" ]] && write_env "$user" "$pass" "http://${domain}" || write_env "$user" "$pass" "http://${domain}:${proxy_port}"
-          compose up -d
-        else
-          warn "Nginx 生效失败，自动降级为仅 Docker 端口访问。"
-          domain=""; proxy_port=""
-        fi
-
-        # 可选 HTTPS（仅当 80 可用且正在使用 80）
-        if [[ -n "$domain" && "$proxy_port" == "80" ]]; then
-          local yn=""
-          read -r -p "是否为该域名启用 HTTPS（Let’s Encrypt/webroot，非侵入）？(y/N): " yn
-          yn="$(trim "${yn:-N}")"
-          if [[ "$yn" == "y" || "$yn" == "Y" ]]; then
-            if ensure_acmesh; then
-              log "尝试签发证书（HTTP-01/webroot）..."
-              if issue_https_webroot "$domain"; then
-                local ck; ck="$(install_https_files "$domain" || true)"
-                if [[ -n "$ck" ]]; then
-                  local cert="${ck%%|*}" key="${ck#*|}"
-                  write_nginx_https_conf "$domain" "$host_port" "$cert" "$key"
-                  if nginx_apply_or_degrade; then
-                    https_enabled="1"
-                    write_env "$user" "$pass" "https://${domain}"
-                    compose up -d
-                    log "HTTPS 已启用：https://${domain}"
-                  else
-                    warn "HTTPS 配置应用失败，保持 HTTP 不变。"
-                    # revert back to http conf
-                    write_nginx_http_conf "$domain" "80" "$host_port"
-                    nginx_apply_or_degrade || true
-                  fi
-                else
-                  warn "证书安装失败，保持 HTTP 不变。"
-                fi
-              else
-                warn "证书签发失败（常见原因：域名未指向本机/80 未通/防火墙拦截），保持 HTTP 不变。"
-              fi
-            else
-              warn "acme.sh 安装失败，保持 HTTP 不变。"
-            fi
-          fi
-        elif [[ -n "$domain" && "$proxy_port" != "80" ]]; then
-          warn "提示：你当前反代端口不是 80（而是 ${proxy_port}），无法做 Let’s Encrypt HTTP-01 自动签发。"
-          warn "如需 HTTPS：请确保 80 可用并使用 80 反代，或改用 DNS 验证（可后续扩展）。"
-        fi
-      fi
-    else
-      domain=""; proxy_port=""
-    fi
+  # PASSWORD 注入校验
+  local core=""; core="$(detect_core_container)"
+  if [[ -n "$core" ]] && ! assert_password_in_container "$core"; then
+    warn "检测到容器内未读到 PASSWORD（会触发安全合规警告），自动重建一次..."
+    compose down --remove-orphans >/dev/null 2>&1 || true
+    compose up -d
+    sleep 1
+  else
+    log "PASSWORD 注入检查通过"
   fi
 
   install_shortcut || true
-  show_access "$user" "$pass" "$host_port" "$domain" "$proxy_port" "$https_enabled"
+  show_access "$user" "$pass" "$host_port" "" "" "0" ""
 }
 
 do_update(){
@@ -598,32 +663,36 @@ do_status(){
   echo "容器状态："
   docker ps -a --format "table {{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}" | (head -n1; grep -E "decotv" || true)
   echo
-  [[ -f "$NGINX_CONF_FILE" ]] && log "Nginx 配置：${NGINX_CONF_FILE}" || warn "未启用/未生成本项目 Nginx 配置"
+  if [[ -d "$PROXY_DIR" && -f "$PROXY_CONF" ]]; then
+    log "已启用 容器反代：${PROXY_CONF}"
+  else
+    warn "未启用 容器反代"
+  fi
   echo
 }
 
 do_logs(){
   ensure_docker
   local n
-  read -r -p "要查看的容器名（默认 decotv-core，可选 decotv-kvrocks）: " n
-  n="$(trim "${n:-decotv-core}")"
+  echo "可选：${PROJECT_NAME}-decotv-core-1 / ${PROJECT_NAME}-decotv-kvrocks-1 / ${PROJECT_NAME}-decotv-proxy-1"
+  read -r -p "输入要查看的容器名（留空默认 core）: " n
+  n="$(trim "${n:-}")"
+  if [[ -z "$n" ]]; then
+    n="$(docker ps --format '{{.Names}}' | grep -E "^${PROJECT_NAME}.*core" | head -n1 || true)"
+  fi
+  [[ -n "$n" ]] || die "找不到容器"
   docker logs --tail 200 -f "$n"
 }
 
 do_uninstall(){
-  warn "将卸载本项目（仅本项目）：停止并移除容器、删除 ${APP_DIR}、移除 ${NGINX_CONF_FILE}"
+  warn "将卸载本项目（仅本项目）：停止并移除容器、删除 ${APP_DIR}"
   read -r -p "确认卸载？(y/N): " yn
   yn="$(trim "${yn:-N}")"
   [[ "$yn" == "y" || "$yn" == "Y" ]] || { log "已取消"; return 0; }
 
   [[ -f "$COMPOSE_FILE" ]] && compose down --remove-orphans || true
-  docker rm -f decotv-core decotv-kvrocks >/dev/null 2>&1 || true
+  docker rm -f decotv-core decotv-kvrocks decotv-proxy >/dev/null 2>&1 || true
   rm -rf "$APP_DIR" >/dev/null 2>&1 || true
-  rm -f "$NGINX_CONF_FILE" >/dev/null 2>&1 || true
-
-  if have nginx; then
-    nginx -t >/dev/null 2>&1 && (systemctl reload nginx >/dev/null 2>&1 || systemctl restart nginx >/dev/null 2>&1 || true) || true
-  fi
 
   warn "如需移除快捷命令：rm -f /usr/local/bin/decotv"
   log "卸载完成"
@@ -631,9 +700,9 @@ do_uninstall(){
 
 menu(){
   echo "=============================="
-  echo " DecoTV · 智能一键部署脚本"
+  echo " DecoTV · 容器域名绑定一键脚本"
   echo "=============================="
-  echo "1) 安装 / 重装（智能清理 + 可选反代 + 可选 HTTPS + 自动降级）"
+  echo "1) 安装 / 重装（容器反代绑定域名 + 可选 HTTPS + 注入校验）"
   echo "2) 更新镜像（pull latest + 重建容器）"
   echo "3) 状态查看"
   echo "4) 查看日志（tail 200 + follow）"
