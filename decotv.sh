@@ -1,380 +1,211 @@
 #!/usr/bin/env bash
 set -euo pipefail
+export LANG=C.UTF-8 LC_ALL=C.UTF-8
 
-# =========================
-# DecoTV One-Click Installer
-# - Docker + Compose
-# - DecoTV + Kvrocks
-# - Optional Nginx reverse proxy (non-invasive: add one conf + reload only)
-# =========================
+APP="DecoTV"
+DIR="/opt/decotv"; ENVF="$DIR/.env"; YML="$DIR/docker-compose.yml"
 
-export LANG=C.UTF-8
-export LC_ALL=C.UTF-8
+need_root(){ [[ "${EUID:-$(id -u)}" -eq 0 ]] || { echo "请用 root 运行（sudo -i）"; exit 1; }; }
+has(){ command -v "$1" >/dev/null 2>&1; }
+pm(){ has apt-get&&echo apt||has dnf&&echo dnf||has yum&&echo yum||has pacman&&echo pacman||echo none; }
+pause(){ read -r -p "按回车继续..." _ || true; }
+installed(){ [[ -f "$ENVF" && -f "$YML" ]]; }
+compose(){ (cd "$DIR" && docker compose --env-file "$ENVF" "$@"); }
 
-APP_NAME="DecoTV"
-WORKDIR="/opt/decotv"
-COMPOSE_FILE="${WORKDIR}/docker-compose.yml"
-ENV_FILE="${WORKDIR}/.env"
-NGINX_CONF_DIR="/etc/nginx/conf.d"
-DEFAULT_PORT="3000"
-
-# ---------- pretty ----------
-c_reset="\033[0m"; c_red="\033[31m"; c_green="\033[32m"; c_yellow="\033[33m"; c_blue="\033[34m"; c_cyan="\033[36m"; c_bold="\033[1m"
-log()  { echo -e "${c_green}[OK]${c_reset} $*"; }
-warn() { echo -e "${c_yellow}[!]${c_reset} $*"; }
-err()  { echo -e "${c_red}[X]${c_reset} $*" >&2; }
-info() { echo -e "${c_blue}[*]${c_reset} $*"; }
-
-need_root() {
-  if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
-    err "请用 root 执行：sudo -i 后再运行"
-    exit 1
-  fi
-}
-
-cmd_exists() { command -v "$1" >/dev/null 2>&1; }
-
-detect_pkg_mgr() {
-  if cmd_exists apt-get; then echo "apt"
-  elif cmd_exists dnf; then echo "dnf"
-  elif cmd_exists yum; then echo "yum"
-  elif cmd_exists pacman; then echo "pacman"
-  else echo "unknown"
-  fi
-}
-
-install_pkgs() {
-  local mgr="$1"; shift
-  local pkgs=("$@")
-  case "$mgr" in
-    apt)
-      DEBIAN_FRONTEND=noninteractive apt-get update -y
-      DEBIAN_FRONTEND=noninteractive apt-get install -y "${pkgs[@]}"
-      ;;
-    dnf)
-      dnf install -y "${pkgs[@]}"
-      ;;
-    yum)
-      yum install -y "${pkgs[@]}"
-      ;;
-    pacman)
-      pacman -Sy --noconfirm "${pkgs[@]}"
-      ;;
-    *)
-      err "不支持的包管理器，无法自动安装依赖：${pkgs[*]}"
-      exit 1
-      ;;
+inst_pkgs(){
+  local m; m="$(pm)"
+  case "$m" in
+    apt) DEBIAN_FRONTEND=noninteractive apt-get update -y >/dev/null
+         DEBIAN_FRONTEND=noninteractive apt-get install -y "$@" >/dev/null ;;
+    dnf) dnf install -y "$@" >/dev/null ;;
+    yum) yum install -y "$@" >/dev/null ;;
+    pacman) pacman -Sy --noconfirm "$@" >/dev/null ;;
+    *) echo "不支持的包管理器，请手动安装：$*"; exit 1 ;;
   esac
 }
 
-ensure_deps() {
-  local mgr
-  mgr="$(detect_pkg_mgr)"
-
-  local need=(curl ca-certificates)
-  if [[ "$mgr" == "apt" ]]; then need+=(gnupg lsb-release)
-  fi
-
-  info "检查基础依赖：${need[*]}"
-  install_pkgs "$mgr" "${need[@]}" >/dev/null 2>&1 || install_pkgs "$mgr" "${need[@]}"
-  log "基础依赖就绪"
+ensure(){
+  has curl || inst_pkgs curl ca-certificates
+  if ! has docker; then curl -fsSL https://get.docker.com | sh; fi
+  has systemctl && systemctl enable --now docker >/dev/null 2>&1 || true
+  docker compose version >/dev/null 2>&1 || inst_pkgs docker-compose-plugin || true
+  docker compose version >/dev/null 2>&1 || { echo "Docker Compose 不可用，请手动安装 compose 插件"; exit 1; }
 }
 
-ensure_docker() {
-  if cmd_exists docker; then
-    log "Docker 已安装：$(docker --version | head -n1)"
-  else
-    warn "Docker 未安装，开始安装（官方脚本方式）..."
-    curl -fsSL https://get.docker.com | sh
-    log "Docker 安装完成：$(docker --version | head -n1)"
-  fi
-
-  # enable/start docker without touching other services
-  if cmd_exists systemctl; then
-    systemctl enable --now docker >/dev/null 2>&1 || true
-  fi
-
-  # compose plugin check
-  if docker compose version >/dev/null 2>&1; then
-    log "Docker Compose 可用：$(docker compose version | head -n1)"
-  else
-    warn "Docker Compose 插件不可用，尝试安装 docker-compose-plugin..."
-    local mgr
-    mgr="$(detect_pkg_mgr)"
-    case "$mgr" in
-      apt) install_pkgs "$mgr" docker-compose-plugin ;;
-      dnf|yum) install_pkgs "$mgr" docker-compose-plugin || install_pkgs "$mgr" docker-compose ;;
-      pacman) install_pkgs "$mgr" docker-compose ;;
-      *) err "无法自动安装 compose，请手动安装后重试"; exit 1 ;;
-    esac
-    docker compose version >/dev/null 2>&1 || { err "Compose 仍不可用，请检查 Docker 安装"; exit 1; }
-    log "Docker Compose 已就绪：$(docker compose version | head -n1)"
-  fi
+ip(){
+  curl -fsSL https://api.ipify.org 2>/dev/null || hostname -I 2>/dev/null | awk '{print $1}'
 }
 
-read_input() {
-  local prompt="$1" default="${2:-}"
-  local val=""
-  if [[ -n "$default" ]]; then
-    read -r -p "$prompt [默认: $default]：" val
-    echo "${val:-$default}"
-  else
-    read -r -p "$prompt：" val
-    echo "$val"
-  fi
+inuse(){ has ss && ss -lnt 2>/dev/null | awk '{print $4}' | grep -qE "[:.]$1$"; }
+pick_port(){
+  local p="${1:-3000}"
+  if [[ "$p" =~ ^[0-9]+$ ]] && ((p>=1&&p<=65535)) && ! inuse "$p"; then echo "$p"; return; fi
+  for x in 3000 3001 3030 3080 3100 3200 8080 18080; do ! inuse "$x" && { echo "$x"; return; }; done
+  while :; do x="$(shuf -i 20000-60000 -n 1 2>/dev/null || echo 3000)"; ! inuse "$x" && { echo "$x"; return; }; done
 }
 
-read_secret_show() {
-  # Read password with echo ON (用户要求可显示)
-  local prompt="$1"
-  local val=""
-  read -r -p "$prompt：" val
-  echo "$val"
+kv(){ grep -E "^$1=" "$ENVF" 2>/dev/null | head -n1 | cut -d= -f2- || true; }
+
+访问地址(){
+  if ! installed; then echo "未安装"; return; fi
+  local p u host
+  p="$(kv APP_PORT)"; u="$(kv USERNAME)"
+  host="$(ip || true)"; [[ -z "${host:-}" ]] && host="<服务器IP>"
+  echo "http://${host}:${p:-?}（账号：${u:-?}）"
 }
 
-port_in_use() {
-  local p="$1"
-  # try ss then netstat
-  if cmd_exists ss; then
-    ss -lnt "( sport = :$p )" 2>/dev/null | grep -q ":$p" && return 0 || return 1
-  elif cmd_exists netstat; then
-    netstat -lnt 2>/dev/null | awk '{print $4}' | grep -qE "[:.]$p$" && return 0 || return 1
-  else
-    # best effort: assume not in use
-    return 1
-  fi
+运行状态(){
+  if ! installed; then echo "未安装"; return; fi
+  local n
+  n="$(compose ps --status running 2>/dev/null | awk 'NR>1{print $1}' | wc -l | tr -d ' ')"
+  [[ "$n" == "2" ]] && echo "运行中" || echo "未完全运行"
 }
 
-pick_listen_port() {
-  local prefer="$1"
-  if ! port_in_use "$prefer"; then
-    echo "$prefer"; return
-  fi
-  # try some alternates
-  for p in 3001 3030 3080 3100 3200 8080 18080; do
-    if ! port_in_use "$p"; then echo "$p"; return; fi
-  done
-  # fallback random high port
-  while :; do
-    local r
-    r="$(shuf -i 20000-60000 -n 1 2>/dev/null || echo 3000)"
-    if ! port_in_use "$r"; then echo "$r"; return; fi
-  done
-}
-
-write_compose() {
-  local app_port="$1"
-  local username="$2"
-  local password="$3"
-
-  mkdir -p "$WORKDIR"
-
-  cat > "$ENV_FILE" <<EOF
-# Generated by decotv.sh
-USERNAME=${username}
-PASSWORD=${password}
-APP_PORT=${app_port}
+write_cfg(){
+  local port="$1" user="$2" pass="$3"
+  mkdir -p "$DIR"
+  cat >"$ENVF" <<EOF
+USERNAME=$user
+PASSWORD=$pass
+APP_PORT=$port
 EOF
-
-  cat > "$COMPOSE_FILE" <<'EOF'
+  cat >"$YML" <<'EOF'
 services:
   decotv-core:
     image: ghcr.io/decohererk/decotv:latest
     container_name: decotv-core
     restart: on-failure
-    ports:
-      - "${APP_PORT}:3000"
+    ports: ["${APP_PORT}:3000"]
     environment:
       - USERNAME=${USERNAME}
       - PASSWORD=${PASSWORD}
       - NEXT_PUBLIC_STORAGE_TYPE=kvrocks
       - KVROCKS_URL=redis://decotv-kvrocks:6666
-    networks:
-      - decotv-network
-    depends_on:
-      - decotv-kvrocks
-
+    networks: [decotv-network]
+    depends_on: [decotv-kvrocks]
   decotv-kvrocks:
-    image: apache/kvrocks
+    image: apache/kvrocks:latest
     container_name: decotv-kvrocks
     restart: unless-stopped
-    volumes:
-      - kvrocks-data:/var/lib/kvrocks
-    networks:
-      - decotv-network
-
-networks:
-  decotv-network:
-    driver: bridge
-
-volumes:
-  kvrocks-data:
+    volumes: [kvrocks-data:/var/lib/kvrocks]
+    networks: [decotv-network]
+networks: { decotv-network: { driver: bridge } }
+volumes: { kvrocks-data: {} }
 EOF
-
-  log "已生成 compose：$COMPOSE_FILE"
 }
 
-up_stack() {
-  info "启动容器..."
-  ( cd "$WORKDIR" && docker compose --env-file "$ENV_FILE" up -d )
-  log "容器已启动"
-}
-
-print_access() {
-  local app_port="$1"
-  local ip
-  ip="$(curl -fsSL https://api.ipify.org 2>/dev/null || true)"
-  if [[ -z "$ip" ]]; then ip="$(hostname -I 2>/dev/null | awk '{print $1}' || true)"; fi
-
-  echo
-  echo -e "${c_bold}==============================${c_reset}"
-  echo -e "${c_bold} ${APP_NAME} 部署完成${c_reset}"
-  echo -e "${c_bold}==============================${c_reset}"
-  echo "本地端口：${app_port}"
-  if [[ -n "${ip:-}" ]]; then
-    echo "访问地址：http://${ip}:${app_port}"
-  else
-    echo "访问地址：http://<你的服务器IP>:${app_port}"
-  fi
-  echo "管理账号：$(grep '^USERNAME=' "$ENV_FILE" | cut -d= -f2-)"
-  echo "管理密码：$(grep '^PASSWORD=' "$ENV_FILE" | cut -d= -f2-)"
-  echo
-  echo "常用命令："
-  echo "  查看状态：cd ${WORKDIR} && docker compose --env-file .env ps"
-  echo "  查看日志：cd ${WORKDIR} && docker compose --env-file .env logs -f --tail=200"
-  echo "  更新镜像：cd ${WORKDIR} && docker compose --env-file .env pull && docker compose --env-file .env up -d"
-  echo "  卸载删除：cd ${WORKDIR} && docker compose --env-file .env down -v"
-  echo
-}
-
-ensure_nginx_installed_if_needed() {
-  local want="$1"
-  [[ "$want" != "y" ]] && return 0
-
-  if cmd_exists nginx; then
-    log "Nginx 已存在：$(nginx -v 2>&1)"
-    return 0
+部署(){
+  ensure
+  if installed; then
+    read -r -p "检测到已安装，是否覆盖并重建？(y/n) [n]：" a
+    [[ "${a:-n}" == "y" ]] || { echo "已取消"; return; }
   fi
 
-  warn "未检测到 Nginx。可选安装（仅安装 nginx 包，不改 nginx.conf）。"
-  local mgr
-  mgr="$(detect_pkg_mgr)"
-  install_pkgs "$mgr" nginx
-  log "Nginx 安装完成"
-  if cmd_exists systemctl; then
-    systemctl enable --now nginx >/dev/null 2>&1 || true
-  fi
-}
-
-write_nginx_proxy() {
-  local domain="$1"
-  local upstream_port="$2"
-  local listen_port="$3"
-
-  mkdir -p "$NGINX_CONF_DIR"
-
-  local conf="${NGINX_CONF_DIR}/decotv_${domain}.conf"
-
-  cat > "$conf" <<EOF
-# Generated by decotv.sh - ${APP_NAME}
-# Non-invasive: standalone conf only
-
-server {
-  listen ${listen_port};
-  server_name ${domain};
-
-  client_max_body_size 20m;
-
-  location / {
-    proxy_http_version 1.1;
-    proxy_set_header Host \$host;
-    proxy_set_header X-Real-IP \$remote_addr;
-    proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-    proxy_set_header X-Forwarded-Proto \$scheme;
-
-    proxy_pass http://127.0.0.1:${upstream_port};
-  }
-}
-EOF
-
-  # test + reload only
-  if nginx -t >/dev/null 2>&1; then
-    if cmd_exists systemctl; then
-      systemctl reload nginx >/dev/null 2>&1 || nginx -s reload >/dev/null 2>&1 || true
-    else
-      nginx -s reload >/dev/null 2>&1 || true
-    fi
-    log "已写入 Nginx 反代配置：$conf（listen ${listen_port}）"
-  else
-    err "nginx -t 未通过，已保留配置文件：$conf（请自行检查后 reload）"
-    nginx -t || true
-  fi
-}
-
-main() {
-  need_root
-  echo -e "${c_bold}${APP_NAME} 一键部署脚本${c_reset}"
-  echo
-
-  ensure_deps
-  ensure_docker
-
-  # Username / Password
-  local username password1 password2
-  username="$(read_input "设置后台用户名" "admin")"
-
+  read -r -p "设置用户名 [admin]：" user; user="${user:-admin}"
   while :; do
-    password1="$(read_secret_show "设置后台密码（可见）")"
-    password2="$(read_secret_show "再次输入密码确认（可见）")"
-    if [[ -z "$password1" ]]; then
-      warn "密码不能为空"
-      continue
-    fi
-    if [[ "$password1" != "$password2" ]]; then
-      warn "两次密码不一致，请重试"
-      continue
-    fi
+    read -r -p "设置密码（可见）：" p1
+    read -r -p "再次确认（可见）：" p2
+    [[ -n "${p1:-}" ]] || { echo "密码不能为空"; continue; }
+    [[ "$p1" == "$p2" ]] || { echo "两次密码不一致"; continue; }
     break
   done
+  read -r -p "外部访问端口 [3000]：" pp; pp="${pp:-3000}"
+  port="$(pick_port "$pp")"
+  [[ "$port" != "$pp" ]] && echo "端口 $pp 已占用，自动选用：$port"
 
-  # Port
-  local prefer_port app_port
-  prefer_port="$(read_input "设置外部访问端口（建议保留默认）" "$DEFAULT_PORT")"
-  app_port="$(pick_listen_port "$prefer_port")"
-  if [[ "$app_port" != "$prefer_port" ]]; then
-    warn "端口 ${prefer_port} 已被占用，已自动选择可用端口：${app_port}"
+  write_cfg "$port" "$user" "$p1"
+  compose up -d
+  echo "部署完成：$(访问地址)"
+}
+
+更新(){
+  ensure; installed || { echo "未安装，请先部署"; return; }
+  compose pull
+  compose up -d
+  echo "更新完成：$(访问地址)"
+}
+
+状态(){
+  ensure; installed || { echo "未安装"; return; }
+  compose ps || true
+  echo "运行状态：$(运行状态)"
+  echo "访问地址：$(访问地址)"
+  echo "密码：$(kv PASSWORD)"
+}
+
+日志(){
+  ensure; installed || { echo "未安装"; return; }
+  echo "提示：按 Ctrl+C 退出日志"
+  compose logs -f --tail=200
+}
+
+卸载(){
+  ensure
+  read -r -p "确认卸载（容器+卷+网络+目录）？(y/n) [n]：" a
+  [[ "${a:-n}" == "y" ]] || { echo "已取消"; return; }
+
+  if installed; then
+    (cd "$DIR" && docker compose --env-file "$ENVF" down -v --remove-orphans) || true
+  else
+    docker rm -f decotv-core >/dev/null 2>&1 || true
+    docker rm -f decotv-kvrocks >/dev/null 2>&1 || true
+  fi
+  docker network rm decotv-network >/dev/null 2>&1 || true
+  docker volume rm kvrocks-data >/dev/null 2>&1 || true
+
+  read -r -p "是否删除镜像（释放空间）？(y/n) [y]：" b
+  if [[ "${b:-y}" == "y" ]]; then
+    docker rmi -f ghcr.io/decohererk/decotv:latest >/dev/null 2>&1 || true
+    docker rmi -f apache/kvrocks:latest >/dev/null 2>&1 || true
   fi
 
-  write_compose "$app_port" "$username" "$password1"
-  up_stack
+  rm -rf "$DIR" || true
+  echo "卸载完成"
+}
 
-  # Optional Nginx
+清理(){
+  ensure
+  echo "仅清理未使用资源：停止容器/悬空镜像/未使用网络/未使用卷"
+  read -r -p "确认执行 Docker 清理？(y/n) [n]：" a
+  [[ "${a:-n}" == "y" ]] || { echo "已取消"; return; }
+  docker system prune -f || true
+  docker volume prune -f || true
+  echo "清理完成"
+}
+
+菜单(){
+  clear 2>/dev/null || true
+  echo "=============================="
+  echo " ${APP} · 交互式管理面板"
+  echo "=============================="
+  echo "当前状态：$(运行状态) ｜ 访问：$(访问地址)"
   echo
-  local use_nginx
-  use_nginx="$(read_input "是否配置 Nginx 反代？(y/n)" "n")"
-  if [[ "$use_nginx" == "y" ]]; then
-    ensure_nginx_installed_if_needed "y"
+  echo "1) 部署 / 重装"
+  echo "2) 更新（拉取最新镜像）"
+  echo "3) 状态（查看信息/密码）"
+  echo "4) 日志（实时跟踪）"
+  echo "5) 卸载（尽量彻底）"
+  echo "6) 清理（Docker 垃圾清理）"
+  echo "0) 退出"
+  echo
+}
 
-    local domain
-    domain="$(read_input "请输入绑定域名（例如 tv.example.com）" "")"
-    if [[ -z "$domain" ]]; then
-      warn "未输入域名，跳过 Nginx 配置"
-    else
-      # choose nginx listen port (avoid assuming 80)
-      local prefer_listen listen_port
-      prefer_listen="$(read_input "Nginx 监听端口（不占用 80/443 更安全）" "8080")"
-      listen_port="$(pick_listen_port "$prefer_listen")"
-      if [[ "$listen_port" != "$prefer_listen" ]]; then
-        warn "端口 ${prefer_listen} 已占用，Nginx 将监听：${listen_port}"
-      fi
-      write_nginx_proxy "$domain" "$app_port" "$listen_port"
-      echo
-      echo "反代访问地址：http://${domain}:${listen_port}"
-      echo "（若你确认 80/443 空闲，也可把监听端口改为 80/443，并自行配置 HTTPS）"
-    fi
-  fi
-
-  print_access "$app_port"
+main(){
+  need_root
+  while :; do
+    菜单
+    read -r -p "请选择 [0-6]：" c
+    case "${c:-}" in
+      1) 部署; pause ;;
+      2) 更新; pause ;;
+      3) 状态; pause ;;
+      4) 日志 ;;
+      5) 卸载; pause ;;
+      6) 清理; pause ;;
+      0) exit 0 ;;
+      *) echo "无效选择"; pause ;;
+    esac
+  done
 }
 
 main "$@"
