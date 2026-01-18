@@ -3,723 +3,757 @@ set -euo pipefail
 export LANG=C.UTF-8
 export LC_ALL=C.UTF-8
 
-# =======================
-# DecoTV Smart One-Click (容器域名绑定方案 - TechLion风格)
-# - 反代用 docker 内置 nginx 容器（decotv-proxy），不依赖系统 nginx
-# - 域名绑定通过 docker network：proxy_pass http://decotv-core:3000
-# - 可重复执行：down --remove-orphans + 清理旧固定名容器
-# - 尽量不冲突：80/443 不可用自动换端口；失败自动降级为直连端口
-# - 密码两次确认；安装后明文显示一次
-# - 更新镜像：pull latest + 重建
-# - 域名解析提示：是否指向本机
-# - 服务探测：多路径等待
-# - HTTPS(可选)：acme.sh + webroot（推荐用 80/443；不通则自动降级）
-# - 关键增强：PASSWORD 注入校验（容器内校验，不通过则自动重建一次）
-# =======================
+# ==========================================================
+# DecoTV One-key Manager (Docker) - menu style
+# - Install / Update / Uninstall
+# - Optional Nginx reverse proxy (non-invasive, only adds our own conf file)
+# - Allow/Block IP + Service Port (iptables, isolated chain)
+#
+# Default stack:
+#   ghcr.io/decohererk/decotv:latest + apache/kvrocks
+#   Service port: host:3000 -> container:3000
+#
+# Data dir:
+#   /opt/decotv
+#
+# ==========================================================
 
-APP_DIR="/opt/decotv"
-COMPOSE_FILE="$APP_DIR/docker-compose.yml"
-ENV_FILE="$APP_DIR/.env"
-PROJECT_NAME="decotv"
+APP="decotv"
+STACK_DIR="/opt/decotv"
+COMPOSE_FILE="${STACK_DIR}/docker-compose.yml"
+ENV_FILE="${STACK_DIR}/.env"
+NGX_DIR="/etc/nginx/${APP}"
+NGX_LINK_DIR="/etc/nginx/conf.d"
+NGX_CONF_LINK=""   # runtime generated: /etc/nginx/conf.d/decotv_<domain>.conf
+CHAIN_NAME="DECO_${APP^^}"  # iptables chain name (DECO_DECOTV)
 
-# images
-IMAGE_CORE="ghcr.io/decohererk/decotv:latest"
-IMAGE_KVROCKS="apache/kvrocks:latest"
-IMAGE_PROXY="nginx:alpine"
+# --------------------------
+# UI helpers
+# --------------------------
+color() { local c="$1"; shift; printf "\033[%sm%s\033[0m" "$c" "$*"; }
+green(){ color "32" "$*"; }
+red(){ color "31" "$*"; }
+yellow(){ color "33" "$*"; }
+blue(){ color "36" "$*"; }
 
-CONTAINER_PORT="3000"
+hr(){ printf "%s\n" "----------------------------------------------"; }
+pause(){ read -r -p "按回车继续..." _; }
 
-# ports
-DEFAULT_HOST_PORT="3000"
-HTTP_PORTS=(80 8080 8880 9080 10080)
-HTTPS_PORTS=(443 8443 9443 10443)
+is_root() { [[ "${EUID:-$(id -u)}" -eq 0 ]]; }
 
-# proxy files
-PROXY_DIR="$APP_DIR/proxy"
-PROXY_CONF="$PROXY_DIR/decotv.conf"
-PROXY_WEBROOT="$PROXY_DIR/www"   # acme webroot
-PROXY_CERTS="$PROXY_DIR/certs"   # mounted certs
+cmd_exists() { command -v "$1" >/dev/null 2>&1; }
 
-log(){  echo "[+] $*"; }
-warn(){ echo "[!] $*"; }
-err(){  echo "[-] $*" >&2; }
-die(){  err "$*"; exit 1; }
-
-need_root(){ [[ "${EUID:-$(id -u)}" -eq 0 ]] || die "请用 root 运行：sudo -i 或 sudo bash $0"; }
-have(){ command -v "$1" >/dev/null 2>&1; }
-
-trim(){
-  local s="$*"
-  s="${s//$'\r'/}"
-  s="${s#"${s%%[![:space:]]*}"}"
-  s="${s%"${s##*[![:space:]]}"}"
-  echo "$s"
-}
-
-pm_detect(){
-  if have apt-get; then echo apt
-  elif have dnf; then echo dnf
-  elif have yum; then echo yum
-  elif have apk; then echo apk
-  else echo unknown
+detect_os_pkg_mgr() {
+  if cmd_exists apt-get; then echo "apt"
+  elif cmd_exists dnf; then echo "dnf"
+  elif cmd_exists yum; then echo "yum"
+  elif cmd_exists apk; then echo "apk"
+  elif cmd_exists pacman; then echo "pacman"
+  else echo "unknown"
   fi
 }
 
-pm_install(){
-  local pm; pm="$(pm_detect)"
-  case "$pm" in
+pkg_install() {
+  local mgr; mgr="$(detect_os_pkg_mgr)"
+  case "$mgr" in
     apt)
-      export DEBIAN_FRONTEND=noninteractive
-      apt-get update -y
-      apt-get install -y "$@"
+      DEBIAN_FRONTEND=noninteractive apt-get update -y
+      DEBIAN_FRONTEND=noninteractive apt-get install -y "$@"
       ;;
     dnf) dnf install -y "$@" ;;
     yum) yum install -y "$@" ;;
     apk) apk add --no-cache "$@" ;;
-    *) die "无法识别包管理器，无法自动安装依赖：$*" ;;
+    pacman) pacman -Sy --noconfirm "$@" ;;
+    *)
+      echo "$(red "不支持的包管理器，无法自动安装依赖：$mgr")"
+      return 1
+      ;;
   esac
 }
 
-ensure_base(){
-  log "检测基础依赖..."
-  local miss=()
-  have curl || miss+=(curl)
-  have openssl || miss+=(openssl)
-  have awk || miss+=(awk)
-  have sed || miss+=(sed)
-  have grep || miss+=(grep)
-  have ss || miss+=(iproute2)
-  if ((${#miss[@]})); then
-    warn "安装依赖：${miss[*]}"
-    pm_install "${miss[@]}" || true
-  fi
+print_title() {
+  clear || true
+  echo
+  echo "=============================="
+  echo " ${APP} · DecoTV Manager"
+  echo "=============================="
 }
 
-port_in_use(){
-  local p="$1"
-  if have ss; then
-    ss -lnt 2>/dev/null | awk '{print $4}' | grep -Eq "(:|\\])${p}$"
+# --------------------------
+# status detection
+# --------------------------
+stack_installed() {
+  [[ -f "$COMPOSE_FILE" ]] && [[ -d "$STACK_DIR" ]]
+}
+
+docker_ok() {
+  cmd_exists docker && docker info >/dev/null 2>&1
+}
+
+compose_cmd() {
+  # prefer docker compose, fallback docker-compose
+  if docker_ok && docker compose version >/dev/null 2>&1; then
+    echo "docker compose"
+  elif cmd_exists docker-compose; then
+    echo "docker-compose"
   else
-    (echo >/dev/tcp/127.0.0.1/"${p}") >/dev/null 2>&1
+    echo ""
   fi
 }
 
-pick_free_port(){
-  local p
-  for p in "$@"; do
-    if ! port_in_use "$p"; then
-      echo "$p"; return 0
-    fi
-  done
-  echo ""
+nginx_ok() {
+  cmd_exists nginx
 }
 
-public_ip(){
+get_public_ip() {
+  # best effort, no hard fail
   local ip=""
-  for u in "https://api.ipify.org" "https://ifconfig.me/ip" "https://icanhazip.com"; do
-    ip="$(curl -fsSL --max-time 5 "$u" 2>/dev/null || true)"
-    ip="${ip//$'\n'/}"
-    [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] && { echo "$ip"; return 0; }
-  done
-  echo "YOUR_SERVER_IP"
+  ip="$(curl -fsSL https://api.ipify.org 2>/dev/null || true)"
+  [[ -n "$ip" ]] || ip="$(curl -fsSL https://ifconfig.me 2>/dev/null || true)"
+  echo "${ip}"
 }
 
-prompt_port(){
-  local tip="$1" def="$2" v=""
-  read -r -p "${tip}(默认 ${def}): " v
-  v="$(trim "${v:-$def}")"
-  [[ "$v" =~ ^[0-9]+$ ]] && ((v>=1 && v<=65535)) || die "端口不合法：$v"
-  echo "$v"
-}
-
-prompt_nonempty(){
-  local tip="$1" v=""
-  while true; do
-    read -r -p "$tip" v
-    v="$(trim "$v")"
-    [[ -n "$v" ]] && { echo "$v"; return 0; }
-    warn "不能为空，请重试。"
-  done
-}
-
-prompt_password_confirm(){
-  local p1 p2
-  while true; do
-    read -r -s -p "请输入管理员密码: " p1; echo
-    read -r -s -p "请再次输入管理员密码: " p2; echo
-    [[ -n "$p1" ]] || { warn "密码不能为空。"; continue; }
-    [[ "$p1" == "$p2" ]] || { warn "两次密码不一致，请重试。"; continue; }
-    echo "$p1"; return 0
-  done
-}
-
-domain_dns_hint(){
-  local domain="$1"
-  local myip; myip="$(public_ip)"
-  [[ "$myip" == "YOUR_SERVER_IP" ]] && return 0
-
-  local ips=""
-  if have getent; then
-    ips="$(getent ahosts "$domain" 2>/dev/null | awk '{print $1}' | sort -u | tr '\n' ' ' | sed 's/  */ /g' | sed 's/ $//')"
-  elif have nslookup; then
-    ips="$(nslookup "$domain" 2>/dev/null | awk '/^Address: /{print $2}' | tr '\n' ' ' | sed 's/  */ /g' | sed 's/ $//')"
+get_listen_port_from_env() {
+  if [[ -f "$ENV_FILE" ]]; then
+    # shellcheck disable=SC1090
+    source "$ENV_FILE" >/dev/null 2>&1 || true
   fi
+  echo "${HOST_PORT:-3000}"
+}
 
-  [[ -z "$ips" ]] && { warn "域名解析检查：未能获取 ${domain} 解析记录（不影响安装）"; return 0; }
+get_domain_from_env() {
+  if [[ -f "$ENV_FILE" ]]; then
+    # shellcheck disable=SC1090
+    source "$ENV_FILE" >/dev/null 2>&1 || true
+  fi
+  echo "${DOMAIN:-}"
+}
 
-  if echo " $ips " | grep -q " $myip "; then
-    log "域名解析检查：${domain} 已指向本机 IP（${myip}）"
+mask_pw() {
+  local s="${1:-}"
+  if [[ -z "$s" ]]; then echo ""; return 0; fi
+  if ((${#s}<=2)); then echo "**"; return 0; fi
+  echo "${s:0:1}***${s: -1}"
+}
+
+# --------------------------
+# deps
+# --------------------------
+ensure_basic_deps() {
+  echo "$(blue "检测依赖...")"
+
+  local need=()
+  cmd_exists curl || need+=(curl)
+  cmd_exists jq || need+=(jq)
+  cmd_exists openssl || need+=(openssl)
+  cmd_exists iptables || need+=(iptables)
+
+  # git optional (not required because we use ghcr image), but handy
+  cmd_exists git || need+=(git)
+
+  if ((${#need[@]})); then
+    echo "$(yellow "缺少依赖：${need[*]}")"
+    echo "$(blue "正在安装依赖（仅安装必要组件，不改动其他服务）...")"
+    pkg_install "${need[@]}"
   else
-    warn "域名解析检查：${domain} 解析为 [${ips}]，本机 IP 是 [${myip}]"
-    warn "如需域名访问，请确认 DNS A/AAAA 指向本机。"
+    echo "$(green "依赖齐全")"
   fi
 }
 
-ensure_docker(){
-  log "检测 Docker..."
-  if have docker; then
-    log "Docker 已存在：$(docker --version 2>/dev/null || true)"
-  else
-    warn "安装 Docker（get.docker.com）..."
-    ensure_base
-    curl -fsSL https://get.docker.com | sh
-  fi
-  systemctl enable --now docker >/dev/null 2>&1 || true
-  docker info >/dev/null 2>&1 || die "Docker 不可用，请检查：systemctl status docker"
-}
-
-ensure_compose(){
-  log "检测 Docker Compose..."
-  if docker compose version >/dev/null 2>&1; then
-    log "Compose 可用：$(docker compose version 2>/dev/null | head -n1)"
+install_docker_if_needed() {
+  if docker_ok; then
+    echo "$(green "Docker 已可用")"
     return 0
   fi
-  if have docker-compose; then
-    log "docker-compose 可用：$(docker-compose --version 2>/dev/null || true)"
-    return 0
-  fi
-  warn "安装 compose 插件..."
-  pm_install docker-compose-plugin || true
-  docker compose version >/dev/null 2>&1 || die "Compose 不可用，请手动安装后重试"
+
+  echo "$(yellow "未检测到可用 Docker，开始安装 Docker（仅安装 Docker，不改动其他服务）...")"
+
+  local mgr; mgr="$(detect_os_pkg_mgr)"
+  case "$mgr" in
+    apt)
+      pkg_install ca-certificates curl gnupg lsb-release
+      install -m 0755 -d /etc/apt/keyrings
+      curl -fsSL https://download.docker.com/linux/$(. /etc/os-release; echo "$ID")/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+      chmod a+r /etc/apt/keyrings/docker.gpg
+      echo \
+        "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/$(. /etc/os-release; echo "$ID") \
+        $(. /etc/os-release; echo "$VERSION_CODENAME") stable" > /etc/apt/sources.list.d/docker.list
+      apt-get update -y
+      apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+      systemctl enable --now docker >/dev/null 2>&1 || true
+      ;;
+    dnf|yum)
+      pkg_install yum-utils
+      yum-config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo >/dev/null 2>&1 || true
+      pkg_install docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+      systemctl enable --now docker >/dev/null 2>&1 || true
+      ;;
+    apk)
+      pkg_install docker docker-cli docker-compose
+      rc-update add docker >/dev/null 2>&1 || true
+      service docker start >/dev/null 2>&1 || true
+      ;;
+    pacman)
+      pkg_install docker docker-compose
+      systemctl enable --now docker >/dev/null 2>&1 || true
+      ;;
+    *)
+      echo "$(red "无法自动安装 Docker：不支持的系统/包管理器")"
+      return 1
+      ;;
+  esac
+
+  docker_ok || { echo "$(red "Docker 安装后仍不可用，请检查 docker 服务状态")"; return 1; }
+  echo "$(green "Docker 安装完成")"
 }
 
-compose(){
-  if docker compose version >/dev/null 2>&1; then
-    (cd "$APP_DIR" && COMPOSE_PROJECT_NAME="$PROJECT_NAME" docker compose -f "$COMPOSE_FILE" "$@")
-  else
-    (cd "$APP_DIR" && COMPOSE_PROJECT_NAME="$PROJECT_NAME" docker-compose -f "$COMPOSE_FILE" "$@")
+ensure_compose() {
+  local cc; cc="$(compose_cmd)"
+  if [[ -z "$cc" ]]; then
+    echo "$(red "未检测到 docker compose / docker-compose")"
+    echo "$(yellow "如果你是 Debian/Ubuntu，建议安装 docker-compose-plugin；或安装 docker-compose")"
+    return 1
   fi
+  echo "$(green "Compose 可用：$cc")"
 }
 
-write_env(){
-  local u="$1" p="$2" base="$3"
+# --------------------------
+# compose stack
+# --------------------------
+write_compose_and_env() {
+  mkdir -p "$STACK_DIR"
+
+  local host_port username password domain storage
+  host_port="${1:-3000}"
+  username="${2:-admin}"
+  password="${3:-}"
+  domain="${4:-}"
+  storage="kvrocks"
+
   cat >"$ENV_FILE" <<EOF
-USERNAME=${u}
-PASSWORD=${p}
-SITE_BASE=${base}
+# Generated by decotv.sh
+HOST_PORT=${host_port}
+USERNAME=${username}
+PASSWORD=${password}
+DOMAIN=${domain}
+STORAGE=${storage}
 EOF
-  chmod 600 "$ENV_FILE"
+
+  cat >"$COMPOSE_FILE" <<'EOF'
+services:
+  decotv-core:
+    image: ghcr.io/decohererk/decotv:latest
+    container_name: decotv-core
+    restart: on-failure
+    ports:
+      - '${HOST_PORT}:3000'
+    environment:
+      - USERNAME=${USERNAME}
+      - PASSWORD=${PASSWORD}
+      - NEXT_PUBLIC_STORAGE_TYPE=kvrocks
+      - KVROCKS_URL=redis://decotv-kvrocks:6666
+    networks:
+      - decotv-network
+    depends_on:
+      - decotv-kvrocks
+
+  decotv-kvrocks:
+    image: apache/kvrocks
+    container_name: decotv-kvrocks
+    restart: unless-stopped
+    volumes:
+      - kvrocks-data:/var/lib/kvrocks
+    networks:
+      - decotv-network
+
+networks:
+  decotv-network:
+    driver: bridge
+
+volumes:
+  kvrocks-data:
+EOF
 }
 
-cleanup_project(){
-  mkdir -p "$APP_DIR"
-  if [[ -f "$COMPOSE_FILE" ]]; then
-    warn "清理本项目残留（down --remove-orphans）..."
-    compose down --remove-orphans >/dev/null 2>&1 || true
+compose_up() {
+  local cc; cc="$(compose_cmd)"
+  [[ -n "$cc" ]] || return 1
+
+  # load env (compose uses it)
+  set -a
+  # shellcheck disable=SC1090
+  source "$ENV_FILE"
+  set +a
+
+  (cd "$STACK_DIR" && $cc -f "$COMPOSE_FILE" up -d)
+}
+
+compose_pull_up() {
+  local cc; cc="$(compose_cmd)"
+  [[ -n "$cc" ]] || return 1
+
+  set -a
+  # shellcheck disable=SC1090
+  source "$ENV_FILE"
+  set +a
+
+  (cd "$STACK_DIR" && $cc -f "$COMPOSE_FILE" pull && $cc -f "$COMPOSE_FILE" up -d)
+}
+
+compose_down() {
+  local cc; cc="$(compose_cmd)"
+  [[ -n "$cc" ]] || return 1
+  if [[ -f "$ENV_FILE" ]]; then
+    set -a
+    # shellcheck disable=SC1090
+    source "$ENV_FILE" || true
+    set +a
   fi
-  # 防御：旧脚本可能写死 container_name
-  for cn in decotv-core decotv-kvrocks decotv-proxy; do
-    if docker ps -a --format '{{.Names}}' | grep -qx "$cn"; then
-      warn "发现旧固定名容器占用：$cn，自动移除..."
-      docker rm -f "$cn" >/dev/null 2>&1 || true
-    fi
-  done
+  (cd "$STACK_DIR" && $cc -f "$COMPOSE_FILE" down) || true
 }
 
-detect_core_container(){
-  docker ps --format '{{.Names}}' | grep -E "^${PROJECT_NAME}.*core" | head -n1 || true
+# --------------------------
+# iptables allow/block (isolated chain)
+# --------------------------
+iptables_ensure_chain() {
+  iptables -S "$CHAIN_NAME" >/dev/null 2>&1 || iptables -N "$CHAIN_NAME"
+  # ensure INPUT jump exists (only one)
+  if ! iptables -C INPUT -j "$CHAIN_NAME" >/dev/null 2>&1; then
+    iptables -I INPUT 1 -j "$CHAIN_NAME"
+  fi
 }
 
-assert_password_in_container(){
-  local core="$1"
-  [[ -n "$core" ]] || return 1
-  local ok=""
-  ok="$(docker exec "$core" sh -lc '[ -n "${PASSWORD:-}" ] && echo OK || echo NO' 2>/dev/null || true)"
-  [[ "$ok" == "OK" ]]
+iptables_flush_rules() {
+  iptables -F "$CHAIN_NAME" >/dev/null 2>&1 || true
 }
 
-write_proxy_http_conf(){
-  local domain="$1" http_port="$2"
-  mkdir -p "$PROXY_DIR" "$PROXY_WEBROOT" "$PROXY_CERTS"
-  cat >"$PROXY_CONF" <<EOF
+iptables_delete_chain() {
+  iptables -D INPUT -j "$CHAIN_NAME" >/dev/null 2>&1 || true
+  iptables -F "$CHAIN_NAME" >/dev/null 2>&1 || true
+  iptables -X "$CHAIN_NAME" >/dev/null 2>&1 || true
+}
+
+iptables_allow_ip_port() {
+  local ip="$1" port="$2"
+  iptables_ensure_chain
+  # accept from IP to port
+  if ! iptables -C "$CHAIN_NAME" -p tcp -s "$ip" --dport "$port" -j ACCEPT >/dev/null 2>&1; then
+    iptables -A "$CHAIN_NAME" -p tcp -s "$ip" --dport "$port" -j ACCEPT
+  fi
+  # optional: keep default rule? we do not block by default unless user chooses block.
+}
+
+iptables_block_ip_port() {
+  local ip="$1" port="$2"
+  iptables_ensure_chain
+  if ! iptables -C "$CHAIN_NAME" -p tcp -s "$ip" --dport "$port" -j DROP >/dev/null 2>&1; then
+    iptables -A "$CHAIN_NAME" -p tcp -s "$ip" --dport "$port" -j DROP
+  fi
+}
+
+iptables_set_default_drop_for_port() {
+  local port="$1"
+  iptables_ensure_chain
+  # drop all tcp to port unless earlier ACCEPT
+  if ! iptables -C "$CHAIN_NAME" -p tcp --dport "$port" -j DROP >/dev/null 2>&1; then
+    iptables -A "$CHAIN_NAME" -p tcp --dport "$port" -j DROP
+  fi
+}
+
+iptables_show() {
+  if iptables -S "$CHAIN_NAME" >/dev/null 2>&1; then
+    iptables -S "$CHAIN_NAME"
+  else
+    echo "(no rules)"
+  fi
+}
+
+# --------------------------
+# nginx reverse proxy (non-invasive)
+# --------------------------
+nginx_write_conf() {
+  local domain="$1" upstream_port="$2" listen_port="${3:-80}"
+  mkdir -p "$NGX_DIR"
+
+  local conf="${NGX_DIR}/${APP}_${domain}.conf"
+  cat >"$conf" <<EOF
+# Generated by decotv.sh
+# Only for DecoTV, does not touch other sites.
 server {
-  listen 80;
+  listen ${listen_port};
   server_name ${domain};
 
-  location ^~ /.well-known/acme-challenge/ {
-    root /var/www/html;
-    default_type "text/plain";
-    try_files \$uri =404;
-  }
+  client_max_body_size 50m;
 
   location / {
-    proxy_pass http://decotv-core:${CONTAINER_PORT};
+    proxy_pass http://127.0.0.1:${upstream_port};
     proxy_http_version 1.1;
     proxy_set_header Host \$host;
     proxy_set_header X-Real-IP \$remote_addr;
     proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
     proxy_set_header X-Forwarded-Proto \$scheme;
-    proxy_set_header Upgrade \$http_upgrade;
-    proxy_set_header Connection "upgrade";
-  }
-}
-EOF
-  # 注意：proxy 容器内部永远监听 80；宿主机用映射端口 http_port
-  : > /dev/null
-}
 
-write_proxy_https_conf(){
-  local domain="$1" cert="$2" key="$3"
-  mkdir -p "$PROXY_DIR" "$PROXY_WEBROOT" "$PROXY_CERTS"
-  cat >"$PROXY_CONF" <<EOF
-server {
-  listen 80;
-  server_name ${domain};
-
-  location ^~ /.well-known/acme-challenge/ {
-    root /var/www/html;
-    default_type "text/plain";
-    try_files \$uri =404;
-  }
-
-  location / { return 301 https://\$host\$request_uri; }
-}
-
-server {
-  listen 443 ssl http2;
-  server_name ${domain};
-
-  ssl_certificate     /etc/nginx/certs/${domain}.crt;
-  ssl_certificate_key /etc/nginx/certs/${domain}.key;
-
-  location / {
-    proxy_pass http://decotv-core:${CONTAINER_PORT};
-    proxy_http_version 1.1;
-    proxy_set_header Host \$host;
-    proxy_set_header X-Real-IP \$remote_addr;
-    proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-    proxy_set_header X-Forwarded-Proto https;
+    # websocket / upgrade
     proxy_set_header Upgrade \$http_upgrade;
     proxy_set_header Connection "upgrade";
   }
 }
 EOF
 
-  cp -f "$cert" "$PROXY_CERTS/${domain}.crt"
-  cp -f "$key"  "$PROXY_CERTS/${domain}.key"
-}
+  # Symlink into conf.d (no nginx.conf modification)
+  NGX_CONF_LINK="${NGX_LINK_DIR}/${APP}_${domain}.conf"
+  ln -sf "$conf" "$NGX_CONF_LINK"
 
-ensure_acmesh(){
-  if [[ -x "${HOME}/.acme.sh/acme.sh" ]] || have acme.sh; then return 0; fi
-  warn "安装 acme.sh（仅用于本项目 HTTPS，webroot 非侵入）..."
-  curl -fsSL https://get.acme.sh | sh >/dev/null 2>&1 || return 1
-  return 0
-}
-
-issue_https_webroot(){
-  local domain="$1"
-  local acme="${HOME}/.acme.sh/acme.sh"
-  [[ -x "$acme" ]] || acme="$(command -v acme.sh 2>/dev/null || true)"
-  [[ -n "${acme:-}" ]] || return 1
-  mkdir -p "$PROXY_WEBROOT/.well-known/acme-challenge"
-  "$acme" --issue -d "$domain" --webroot "$PROXY_WEBROOT" --keylength ec-256 >/dev/null 2>&1 \
-    || "$acme" --issue -d "$domain" --webroot "$PROXY_WEBROOT" >/dev/null 2>&1 \
-    || return 1
-  return 0
-}
-
-export_https_files(){
-  local domain="$1"
-  local acme="${HOME}/.acme.sh/acme.sh"
-  [[ -x "$acme" ]] || acme="$(command -v acme.sh 2>/dev/null || true)"
-  [[ -n "${acme:-}" ]] || return 1
-
-  local outdir="$PROXY_DIR/_acme_out"
-  mkdir -p "$outdir"
-  local cert="${outdir}/${domain}.crt"
-  local key="${outdir}/${domain}.key"
-
-  "$acme" --install-cert -d "$domain" --ecc --key-file "$key" --fullchain-file "$cert" >/dev/null 2>&1 \
-    || "$acme" --install-cert -d "$domain" --key-file "$key" --fullchain-file "$cert" >/dev/null 2>&1 \
-    || return 1
-
-  echo "${cert}|${key}"
-}
-
-wait_ready(){
-  local port="$1"
-  have curl || return 0
-  local base="http://127.0.0.1:${port}"
-  local paths=("/" "/login" "/api" "/api/health" "/health" "/healthz")
-  local i
-  log "服务探测：等待服务可用..."
-  for ((i=0;i<20;i++)); do
-    local p
-    for p in "${paths[@]}"; do
-      if curl -fsS --max-time 2 "${base}${p}" >/dev/null 2>&1; then
-        log "服务探测：${base}${p} 可访问"
-        return 0
-      fi
-    done
-    sleep 1
-  done
-  warn "服务探测：未在预期时间内确认（不代表失败），你可稍后重试访问"
-  return 0
-}
-
-write_compose(){
-  local host_port="$1"
-  local enable_proxy="$2"   # 0/1
-  local http_port="$3"      # host http mapped port
-  local enable_https="$4"   # 0/1
-  local https_port="$5"     # host https mapped port
-
-  mkdir -p "$APP_DIR" "$PROXY_DIR" "$PROXY_WEBROOT" "$PROXY_CERTS"
-
-  if [[ "$enable_proxy" == "1" ]]; then
-    # 有域名反代时：core 不强制暴露宿主端口（避免冲突）
-    cat >"$COMPOSE_FILE" <<EOF
-services:
-  decotv-core:
-    image: ${IMAGE_CORE}
-    restart: on-failure
-    env_file: [./.env]
-    environment:
-      - USERNAME=\${USERNAME}
-      - PASSWORD=\${PASSWORD}
-      - SITE_BASE=\${SITE_BASE}
-      - NEXT_PUBLIC_STORAGE_TYPE=kvrocks
-      - KVROCKS_URL=redis://decotv-kvrocks:6666
-    expose: ['${CONTAINER_PORT}']
-    networks: [decotv-network]
-    depends_on: [decotv-kvrocks]
-
-  decotv-kvrocks:
-    image: ${IMAGE_KVROCKS}
-    restart: unless-stopped
-    volumes: [kvrocks-data:/var/lib/kvrocks]
-    networks: [decotv-network]
-
-  decotv-proxy:
-    image: ${IMAGE_PROXY}
-    restart: unless-stopped
-    ports:
-      - '${http_port}:80'
-EOF
-
-    if [[ "$enable_https" == "1" ]]; then
-      cat >>"$COMPOSE_FILE" <<EOF
-      - '${https_port}:443'
-EOF
-    fi
-
-    cat >>"$COMPOSE_FILE" <<EOF
-    volumes:
-      - ./proxy/decotv.conf:/etc/nginx/conf.d/default.conf:ro
-      - ./proxy/www:/var/www/html:ro
-      - ./proxy/certs:/etc/nginx/certs:ro
-    networks: [decotv-network]
-    depends_on: [decotv-core]
-
-networks:
-  decotv-network: { driver: bridge }
-
-volumes:
-  kvrocks-data: {}
-EOF
-
+  nginx -t >/dev/null
+  # reload only nginx (do not restart unrelated services)
+  if cmd_exists systemctl && systemctl is-active nginx >/dev/null 2>&1; then
+    systemctl reload nginx
   else
-    # 无域名反代：对外直接暴露 host_port
-    cat >"$COMPOSE_FILE" <<EOF
-services:
-  decotv-core:
-    image: ${IMAGE_CORE}
-    restart: on-failure
-    ports: ['${host_port}:${CONTAINER_PORT}']
-    env_file: [./.env]
-    environment:
-      - USERNAME=\${USERNAME}
-      - PASSWORD=\${PASSWORD}
-      - SITE_BASE=\${SITE_BASE}
-      - NEXT_PUBLIC_STORAGE_TYPE=kvrocks
-      - KVROCKS_URL=redis://decotv-kvrocks:6666
-    networks: [decotv-network]
-    depends_on: [decotv-kvrocks]
-
-  decotv-kvrocks:
-    image: ${IMAGE_KVROCKS}
-    restart: unless-stopped
-    volumes: [kvrocks-data:/var/lib/kvrocks]
-    networks: [decotv-network]
-
-networks:
-  decotv-network: { driver: bridge }
-
-volumes:
-  kvrocks-data: {}
-EOF
+    nginx -s reload >/dev/null 2>&1 || true
   fi
 }
 
-install_shortcut(){
-  local bin="/usr/local/bin/decotv"
-  cat >"$bin" <<EOF
-#!/usr/bin/env bash
-exec bash "${APP_DIR}/decotv.sh" "\$@"
-EOF
-  chmod +x "$bin"
-  log "快捷命令：decotv"
-}
+nginx_remove_conf() {
+  local domain="$1"
+  local conf="${NGX_DIR}/${APP}_${domain}.conf"
+  local link="${NGX_LINK_DIR}/${APP}_${domain}.conf"
 
-show_access(){
-  local user="$1" pass="$2"
-  local host_port="$3"
-  local domain="${4:-}"
-  local http_port="${5:-}"
-  local https_on="${6:-0}"
-  local https_port="${7:-}"
-
-  local ip; ip="$(public_ip)"
-  echo
-  echo "=============================="
-  echo " DecoTV 部署完成"
-  echo "=============================="
-  echo "管理员账号: ${user}"
-  echo "管理员密码: ${pass}"
-
-  if [[ -n "$domain" ]]; then
-    if [[ "$https_on" == "1" ]]; then
-      if [[ "$https_port" == "443" ]]; then
-        echo "访问地址(HTTPS): https://${domain}"
-      else
-        echo "访问地址(HTTPS): https://${domain}:${https_port}"
-      fi
-    else
-      if [[ "$http_port" == "80" ]]; then
-        echo "访问地址(域名): http://${domain}"
-      else
-        echo "访问地址(域名): http://${domain}:${http_port}"
-      fi
-    fi
-    echo "说明：域名反代由 docker 容器 decotv-proxy 提供（更稳，不依赖系统 nginx）"
-  else
-    echo "Docker 端口 : ${host_port}"
-    echo "访问地址(IP):   http://${ip}:${host_port}"
+  rm -f "$link" "$conf" >/dev/null 2>&1 || true
+  if nginx_ok; then
+    nginx -t >/dev/null 2>&1 && (systemctl reload nginx >/dev/null 2>&1 || nginx -s reload >/dev/null 2>&1 || true)
   fi
-
-  echo "安装目录: ${APP_DIR}"
-  echo
 }
 
-do_install(){
-  ensure_base
-  ensure_docker
+# --------------------------
+# actions
+# --------------------------
+action_install() {
+  print_title
+  echo "$(blue "${APP} 未安装 -> 安装")"
+  hr
+
+  ensure_basic_deps
+  install_docker_if_needed
   ensure_compose
 
-  local host_port user pass domain
-  host_port="$(prompt_port "请输入 DecoTV 对外端口（无域名反代时使用）" "$DEFAULT_HOST_PORT")"
-  port_in_use "$host_port" && warn "端口 ${host_port} 已被占用（如果你启用域名反代，将不会用到这个端口）"
+  local host_port username password domain
+  read -r -p "设置访问端口（默认 3000，回车使用默认）： " host_port
+  host_port="${host_port:-3000}"
 
-  user="$(prompt_nonempty "请输入管理员用户名: ")"
-  pass="$(prompt_password_confirm)"
+  read -r -p "设置后台用户名（默认 admin，回车使用默认）： " username
+  username="${username:-admin}"
 
-  read -r -p "如需启用 域名反代(容器Nginx)，请输入绑定域名（留空则不启用）: " domain
-  domain="$(trim "$domain")"
+  while true; do
+    read -r -s -p "设置后台密码（必填，输入后回车）： " password
+    echo
+    [[ -n "$password" ]] && break
+    echo "$(yellow "密码不能为空")"
+  done
 
-  mkdir -p "$APP_DIR"
-  cp -f "$0" "${APP_DIR}/decotv.sh" >/dev/null 2>&1 || true
-  chmod +x "${APP_DIR}/decotv.sh" >/dev/null 2>&1 || true
+  read -r -p "绑定域名（可选，回车跳过）： " domain
+  domain="${domain:-}"
 
-  cleanup_project
+  echo
+  echo "$(blue "写入 compose 配置...")"
+  write_compose_and_env "$host_port" "$username" "$password" "$domain"
 
-  local enable_proxy="0" http_port="" enable_https="0" https_port="" site_base=""
+  echo "$(blue "启动容器...")"
+  compose_up
+
+  echo
+  echo "$(green "安装完成 ✅")"
+  hr
+
+  local ip; ip="$(get_public_ip)"
+  local shown_pw; shown_pw="$(mask_pw "$password")"
 
   if [[ -n "$domain" ]]; then
-    enable_proxy="1"
-    domain_dns_hint "$domain" || true
-
-    http_port="$(pick_free_port "${HTTP_PORTS[@]}")"
-    [[ -n "$http_port" ]] || { warn "找不到可用 HTTP 端口（80/8080/8880/9080/10080），将降级为直连端口"; enable_proxy="0"; }
+    echo "绑定域名：$(green "$domain")"
   fi
 
-  if [[ "$enable_proxy" == "1" ]]; then
-    # 先生成 HTTP 反代配置（容器内监听 80，宿主机映射 http_port）
-    write_proxy_http_conf "$domain" "$http_port"
-    site_base="http://${domain}"
-    [[ "$http_port" != "80" ]] && site_base="http://${domain}:${http_port}"
-    write_env "$user" "$pass" "$site_base"
-    write_compose "$host_port" "1" "$http_port" "0" "0"
+  echo "用户名：$(green "$username")"
+  echo "密码：$(green "$shown_pw")"
 
-    log "启动容器（含 decotv-proxy）..."
-    compose up -d
-    log "容器已启动"
+  if [[ -n "$domain" ]]; then
+    echo "访问地址（域名）：$(green "http://${domain}/")"
+  fi
 
-    # PASSWORD 注入校验
-    local core=""; core="$(detect_core_container)"
-    if [[ -n "$core" ]] && ! assert_password_in_container "$core"; then
-      warn "检测到容器内未读到 PASSWORD（会触发安全合规警告），自动重建一次..."
-      compose down --remove-orphans >/dev/null 2>&1 || true
-      compose up -d
-      sleep 1
-      core="$(detect_core_container)"
-      if [[ -n "$core" ]] && assert_password_in_container "$core"; then
-        log "PASSWORD 注入修复成功"
-      else
-        warn "仍未确认 PASSWORD 注入成功：请检查 ${ENV_FILE}"
-      fi
-    else
-      log "PASSWORD 注入检查通过"
-    fi
+  if [[ -n "$ip" ]]; then
+    echo "访问地址（IP）：$(green "http://${ip}:${host_port}/")"
+  else
+    echo "访问地址：$(green "http://<服务器IP>:${host_port}/")"
+  fi
 
-    # 可选 HTTPS：只有当 http_port==80 或者你愿意映射 80 给 proxy 才更稳
-    if [[ "$http_port" == "80" ]]; then
-      local yn=""
-      read -r -p "是否为该域名启用 HTTPS（Let’s Encrypt/webroot，非侵入）？(y/N): " yn
-      yn="$(trim "${yn:-N}")"
-      if [[ "$yn" == "y" || "$yn" == "Y" ]]; then
-        https_port="$(pick_free_port "${HTTPS_PORTS[@]}")"
-        if [[ -z "$https_port" ]]; then
-          warn "找不到可用 HTTPS 端口（443/8443/9443/10443），跳过 HTTPS"
-        else
-          ensure_acmesh || warn "acme.sh 安装失败，跳过 HTTPS"
-          if issue_https_webroot "$domain"; then
-            local ck; ck="$(export_https_files "$domain" || true)"
-            if [[ -n "$ck" ]]; then
-              local cert="${ck%%|*}" key="${ck#*|}"
-              write_proxy_https_conf "$domain" "$cert" "$key"
-              enable_https="1"
-              site_base="https://${domain}"
-              [[ "$https_port" != "443" ]] && site_base="https://${domain}:${https_port}"
-              write_env "$user" "$pass" "$site_base"
+  echo
+  echo "$(yellow "提示：DecoTV 部署后为空壳，需要你在后台自己填播放源配置。")"
+  pause
+}
 
-              # 重新写 compose：把 443(容器) 映射到宿主 https_port
-              write_compose "$host_port" "1" "$http_port" "1" "$https_port"
-              compose up -d
-              log "HTTPS 已启用：$site_base"
-            else
-              warn "证书导出失败，保持 HTTP 不变"
-            fi
-          else
-            warn "证书签发失败（常见：域名未指向本机/80 不通/防火墙拦截），保持 HTTP 不变"
-          fi
-        fi
-      fi
-    else
-      warn "提示：当前 HTTP 端口不是 80（而是 ${http_port}），Let’s Encrypt HTTP-01 自动签发成功率会很低。"
-      warn "建议：让 80 可用再启用 HTTPS，或后续扩展 DNS 验证。"
-    fi
+action_update() {
+  print_title
+  echo "$(blue "${APP} -> 更新")"
+  hr
 
-    install_shortcut || true
-    show_access "$user" "$pass" "$host_port" "$domain" "$http_port" "$enable_https" "$https_port"
+  if ! stack_installed; then
+    echo "$(red "未检测到安装：${STACK_DIR}")"
+    pause
     return 0
   fi
 
-  # 降级：无域名反代（直连端口）
-  write_env "$user" "$pass" ""
-  write_compose "$host_port" "0" "0" "0" "0"
-  log "启动容器（直连端口）..."
-  compose up -d
-  log "容器已启动"
-  wait_ready "$host_port" || true
-
-  # PASSWORD 注入校验
-  local core=""; core="$(detect_core_container)"
-  if [[ -n "$core" ]] && ! assert_password_in_container "$core"; then
-    warn "检测到容器内未读到 PASSWORD（会触发安全合规警告），自动重建一次..."
-    compose down --remove-orphans >/dev/null 2>&1 || true
-    compose up -d
-    sleep 1
-  else
-    log "PASSWORD 注入检查通过"
-  fi
-
-  install_shortcut || true
-  show_access "$user" "$pass" "$host_port" "" "" "0" ""
-}
-
-do_update(){
-  [[ -f "$COMPOSE_FILE" ]] || die "未检测到安装（${COMPOSE_FILE}），请先安装。"
-  ensure_docker
+  ensure_basic_deps
+  install_docker_if_needed
   ensure_compose
-  log "更新镜像：pull latest + 重建容器..."
-  compose pull
-  compose up -d
-  log "更新完成"
+
+  echo "$(blue "拉取最新镜像并重启容器...")"
+  compose_pull_up
+
+  echo "$(green "更新完成 ✅")"
+  pause
 }
 
-do_status(){
-  ensure_docker
+action_uninstall() {
+  print_title
+  echo "$(blue "${APP} -> 卸载")"
+  hr
+
+  if ! stack_installed; then
+    echo "$(yellow "未检测到安装，无需卸载")"
+    pause
+    return 0
+  fi
+
+  local domain; domain="$(get_domain_from_env || true)"
+  local port; port="$(get_listen_port_from_env || true)"
+
+  read -r -p "确认卸载（会停止并删除容器，删除 ${STACK_DIR}）？(y/N): " yn
+  if [[ "${yn:-N}" != "y" && "${yn:-N}" != "Y" ]]; then
+    echo "已取消"
+    pause
+    return 0
+  fi
+
+  echo "$(blue "停止并删除容器...")"
+  compose_down
+
+  if [[ -n "$domain" ]]; then
+    echo "$(blue "清理 Nginx 配置（如存在）...")"
+    nginx_remove_conf "$domain" || true
+  fi
+
+  echo "$(blue "清理 iptables 规则（仅清理本脚本创建的链）...")"
+  iptables_delete_chain || true
+
+  echo "$(blue "删除目录：${STACK_DIR}")"
+  rm -rf "$STACK_DIR"
+
+  echo "$(green "卸载完成 ✅")"
+  pause
+}
+
+action_add_domain() {
+  print_title
+  echo "$(blue "添加域名访问（Nginx 反代）")"
+  hr
+
+  if ! stack_installed; then
+    echo "$(red "请先安装 ${APP}")"
+    pause
+    return 0
+  fi
+
+  ensure_basic_deps
+
+  if ! nginx_ok; then
+    echo "$(yellow "未检测到 nginx")"
+    read -r -p "是否安装 nginx？(y/N): " yn
+    if [[ "${yn:-N}" == "y" || "${yn:-N}" == "Y" ]]; then
+      pkg_install nginx
+    else
+      echo "已取消"
+      pause
+      return 0
+    fi
+  fi
+
+  local domain listen_port upstream_port
+  upstream_port="$(get_listen_port_from_env)"
+  read -r -p "请输入域名（例如 tv.example.com）： " domain
+  [[ -n "$domain" ]] || { echo "$(red "域名不能为空")"; pause; return 0; }
+
+  read -r -p "Nginx 监听端口（默认 80，回车使用默认）： " listen_port
+  listen_port="${listen_port:-80}"
+
+  echo "$(blue "写入 Nginx 配置并 reload...")"
+  nginx_write_conf "$domain" "$upstream_port" "$listen_port"
+
+  # persist DOMAIN
+  if [[ -f "$ENV_FILE" ]]; then
+    # simple replace or append
+    if grep -q '^DOMAIN=' "$ENV_FILE"; then
+      sed -i "s|^DOMAIN=.*|DOMAIN=${domain}|g" "$ENV_FILE"
+    else
+      echo "DOMAIN=${domain}" >> "$ENV_FILE"
+    fi
+  fi
+
   echo
-  echo "容器状态："
-  docker ps -a --format "table {{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}" | (head -n1; grep -E "decotv" || true)
-  echo
-  if [[ -d "$PROXY_DIR" && -f "$PROXY_CONF" ]]; then
-    log "已启用 容器反代：${PROXY_CONF}"
+  echo "$(green "已添加域名反代 ✅")"
+  echo "访问地址：$(green "http://${domain}:${listen_port}/")"
+  pause
+}
+
+action_del_domain() {
+  print_title
+  echo "$(blue "删除域名访问（移除 Nginx 反代）")"
+  hr
+
+  ensure_basic_deps
+
+  if ! nginx_ok; then
+    echo "$(yellow "nginx 未安装，无需删除反代")"
+    pause
+    return 0
+  fi
+
+  local domain
+  domain="$(get_domain_from_env || true)"
+  if [[ -z "$domain" ]]; then
+    read -r -p "未在配置中找到域名，请手动输入要删除的域名： " domain
   else
-    warn "未启用 容器反代"
+    echo "当前记录域名：$(green "$domain")"
+    read -r -p "回车确认删除该域名反代，或输入其他域名： " d2
+    domain="${d2:-$domain}"
   fi
+
+  [[ -n "$domain" ]] || { echo "$(red "域名不能为空")"; pause; return 0; }
+
+  echo "$(blue "删除 Nginx 配置并 reload...")"
+  nginx_remove_conf "$domain" || true
+
+  if [[ -f "$ENV_FILE" ]] && grep -q '^DOMAIN=' "$ENV_FILE"; then
+    sed -i "s|^DOMAIN=.*|DOMAIN=|g" "$ENV_FILE"
+  fi
+
+  echo "$(green "已删除域名反代 ✅")"
+  pause
+}
+
+action_allow_ip_port() {
+  print_title
+  echo "$(blue "允许 IP + 端口访问（iptables）")"
+  hr
+
+  ensure_basic_deps
+
+  local ip port
+  read -r -p "请输入允许的 IP（例如 1.2.3.4）： " ip
+  [[ -n "$ip" ]] || { echo "$(red "IP 不能为空")"; pause; return 0; }
+
+  port="$(get_listen_port_from_env)"
+  read -r -p "端口（默认 ${port}，回车使用默认）： " p2
+  port="${p2:-$port}"
+
+  iptables_allow_ip_port "$ip" "$port"
+  echo "$(green "已允许：${ip} -> tcp/${port}")"
   echo
+  echo "$(yellow "当前规则：")"
+  iptables_show
+  pause
 }
 
-do_logs(){
-  ensure_docker
-  local n
-  echo "可选：${PROJECT_NAME}-decotv-core-1 / ${PROJECT_NAME}-decotv-kvrocks-1 / ${PROJECT_NAME}-decotv-proxy-1"
-  read -r -p "输入要查看的容器名（留空默认 core）: " n
-  n="$(trim "${n:-}")"
-  if [[ -z "$n" ]]; then
-    n="$(docker ps --format '{{.Names}}' | grep -E "^${PROJECT_NAME}.*core" | head -n1 || true)"
-  fi
-  [[ -n "$n" ]] || die "找不到容器"
-  docker logs --tail 200 -f "$n"
-}
+action_block_ip_port() {
+  print_title
+  echo "$(blue "阻止 IP + 端口访问（iptables）")"
+  hr
 
-do_uninstall(){
-  warn "将卸载本项目（仅本项目）：停止并移除容器、删除 ${APP_DIR}"
-  read -r -p "确认卸载？(y/N): " yn
-  yn="$(trim "${yn:-N}")"
-  [[ "$yn" == "y" || "$yn" == "Y" ]] || { log "已取消"; return 0; }
+  ensure_basic_deps
 
-  [[ -f "$COMPOSE_FILE" ]] && compose down --remove-orphans || true
-  docker rm -f decotv-core decotv-kvrocks decotv-proxy >/dev/null 2>&1 || true
-  rm -rf "$APP_DIR" >/dev/null 2>&1 || true
+  local ip port mode
+  port="$(get_listen_port_from_env)"
+  echo "1) 阻止某个 IP 访问端口"
+  echo "2) 仅允许白名单（把端口默认 DROP，再用“允许”添加白名单）"
+  read -r -p "选择 (1/2)： " mode
+  mode="${mode:-1}"
 
-  warn "如需移除快捷命令：rm -f /usr/local/bin/decotv"
-  log "卸载完成"
-}
-
-menu(){
-  echo "=============================="
-  echo " DecoTV · 容器域名绑定一键脚本"
-  echo "=============================="
-  echo "1) 安装 / 重装（容器反代绑定域名 + 可选 HTTPS + 注入校验）"
-  echo "2) 更新镜像（pull latest + 重建容器）"
-  echo "3) 状态查看"
-  echo "4) 查看日志（tail 200 + follow）"
-  echo "5) 卸载（仅移除本项目）"
-  echo "0) 退出"
-  read -r -p "请选择: " c
-  c="$(trim "${c:-}")"
-  case "$c" in
-    1) do_install ;;
-    2) do_update ;;
-    3) do_status ;;
-    4) do_logs ;;
-    5) do_uninstall ;;
-    0) exit 0 ;;
-    *) warn "无效选择" ;;
+  case "$mode" in
+    1)
+      read -r -p "请输入要阻止的 IP（例如 1.2.3.4）： " ip
+      [[ -n "$ip" ]] || { echo "$(red "IP 不能为空")"; pause; return 0; }
+      read -r -p "端口（默认 ${port}，回车使用默认）： " p2
+      port="${p2:-$port}"
+      iptables_block_ip_port "$ip" "$port"
+      echo "$(green "已阻止：${ip} -> tcp/${port}")"
+      ;;
+    2)
+      read -r -p "端口（默认 ${port}，回车使用默认）： " p2
+      port="${p2:-$port}"
+      iptables_set_default_drop_for_port "$port"
+      echo "$(green "已设置：tcp/${port} 默认 DROP（请用“允许 IP+端口访问”添加白名单）")"
+      ;;
+    *)
+      echo "已取消"
+      pause
+      return 0
+      ;;
   esac
+
+  echo
+  echo "$(yellow "当前规则：")"
+  iptables_show
+  pause
 }
 
-main(){ need_root; menu; }
-main "$@"
+action_back() { return 0; }
+
+# --------------------------
+# main menu
+# --------------------------
+main_menu() {
+  while true; do
+    print_title
+
+    local state port domain
+    if stack_installed; then state="$(green "已安装")"; else state="$(yellow "未安装")"; fi
+    port="$(get_listen_port_from_env || true)"
+    domain="$(get_domain_from_env || true)"
+
+    echo "$(green "${APP}") ${state}"
+    echo "${APP} Docker 镜像：ghcr.io/decohererk/decotv:latest"
+    [[ -n "$domain" ]] && echo "已绑定域名：$(green "$domain")" || true
+    echo "服务端口：$(green "${port}")"
+    echo "项目目录：${STACK_DIR}"
+    hr
+    echo "1. 安装"
+    echo "2. 更新"
+    echo "3. 卸载"
+    echo
+    echo "5. 添加域名访问（Nginx 反代）"
+    echo "6. 删除域名访问（Nginx 反代）"
+    echo "7. 允许 IP+端口 访问（iptables）"
+    echo "8. 阻止 IP+端口 访问（iptables）"
+    hr
+    echo "0. 退出"
+    echo
+    read -r -p "请输入你的选择: " choice
+
+    case "${choice:-}" in
+      1) action_install ;;
+      2) action_update ;;
+      3) action_uninstall ;;
+      5) action_add_domain ;;
+      6) action_del_domain ;;
+      7) action_allow_ip_port ;;
+      8) action_block_ip_port ;;
+      0) exit 0 ;;
+      *) echo "$(yellow "无效选择")"; pause ;;
+    esac
+  done
+}
+
+# entry
+if ! is_root; then
+  echo "$(red "请使用 root 运行：sudo bash $0")"
+  exit 1
+fi
+
+main_menu
