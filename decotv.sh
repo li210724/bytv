@@ -1,511 +1,509 @@
 #!/usr/bin/env bash
 set -euo pipefail
-
-# ==========================================================
-# DecoTV One-key Deploy (Docker Compose)
-#
-# Safety rules:
-# - Only touches: /opt/decotv (and subpaths)
-# - Only manages containers: decotv-core, decotv-kvrocks
-# - Does NOT assume 80/443 are available
-# - Does NOT modify nginx.conf / default site / other sites
-# - If nginx config is generated, it does NOT reload/restart nginx
-#
-# Usage:
-#   bash decotv-onekey.sh              # install/update & start
-#   bash decotv-onekey.sh status       # show status
-#   bash decotv-onekey.sh logs         # show last 200 logs
-#   bash decotv-onekey.sh restart      # restart
-#   bash decotv-onekey.sh stop         # stop
-#   bash decotv-onekey.sh uninstall    # uninstall (only this project)
-# ==========================================================
-
 export LANG=C.UTF-8
 export LC_ALL=C.UTF-8
 
+# ===========================
+# DecoTV One-Click Deploy
+# - Docker + (Optional) Nginx reverse proxy
+# - Non-invasive, avoid conflicts
+# ===========================
+
 APP_NAME="decotv"
-APP_DIR="/opt/${APP_NAME}"
+APP_DIR="/opt/decotv"
 COMPOSE_FILE="${APP_DIR}/docker-compose.yml"
 ENV_FILE="${APP_DIR}/.env"
-KV_DATA_DIR="${APP_DIR}/kvrocks-data"
-NGINX_DIR_LOCAL="${APP_DIR}/nginx"
-NGINX_PREFIX="decotv"
+NGINX_CONF_DIR="/etc/nginx/conf.d"
+NGINX_CONF_FILE="${NGINX_CONF_DIR}/decotv.conf"
 
-# ---------- Pretty output ----------
-if [[ -t 1 ]]; then
-  C_RESET="\033[0m"; C_BOLD="\033[1m"
-  C_RED="\033[31m"; C_GREEN="\033[32m"; C_YELLOW="\033[33m"; C_BLUE="\033[34m"; C_CYAN="\033[36m"
-else
-  C_RESET=""; C_BOLD=""; C_RED=""; C_GREEN=""; C_YELLOW=""; C_BLUE=""; C_CYAN=""
-fi
+IMAGE_CORE="ghcr.io/decohererk/decotv:latest"   # from upstream README examples
+IMAGE_KVROCKS="apache/kvrocks:latest"
 
-ok()   { printf "%b[OK]%b %s\n"   "$C_GREEN" "$C_RESET" "$*"; }
-info() { printf "%b[INFO]%b %s\n" "$C_CYAN"  "$C_RESET" "$*"; }
-warn() { printf "%b[WARN]%b %s\n" "$C_YELLOW" "$C_RESET" "$*"; }
-err()  { printf "%b[ERR]%b %s\n"  "$C_RED"   "$C_RESET" "$*"; }
+DEFAULT_APP_PORT="3000"     # container exposed port
+DEFAULT_HOST_PORT="3000"    # host port (can change)
+DEFAULT_PROXY_HTTP_PORT="80"
+FALLBACK_PROXY_HTTP_PORT="8080"
+
+# --------- utils ----------
+log()  { printf "\033[1;32m[+]\033[0m %s\n" "$*"; }
+warn() { printf "\033[1;33m[!]\033[0m %s\n" "$*"; }
+err()  { printf "\033[1;31m[-]\033[0m %s\n" "$*"; }
 die()  { err "$*"; exit 1; }
 
-hr() { printf "%b%s%b\n" "$C_BLUE" "==================================================" "$C_RESET"; }
-
-banner() {
-  hr
-  printf "%bDecoTV · One-key Deploy%b\n" "$C_BOLD" "$C_RESET"
-  printf "Dir: %s\n" "$APP_DIR"
-  hr
-}
-
-# ---------- helpers ----------
-have_cmd() { command -v "$1" >/dev/null 2>&1; }
 need_root() {
   if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
-    die "Please run as root: sudo -i  (then rerun)"
+    die "请使用 root 运行：sudo -i 或 sudo bash $0"
   fi
 }
 
-os_id() {
+cmd_exists() { command -v "$1" >/dev/null 2>&1; }
+
+detect_os() {
+  # set OS_ID, OS_LIKE
+  OS_ID=""
+  OS_LIKE=""
   if [[ -r /etc/os-release ]]; then
     # shellcheck disable=SC1091
     . /etc/os-release
-    echo "${ID:-unknown}"
-  else
-    echo "unknown"
+    OS_ID="${ID:-}"
+    OS_LIKE="${ID_LIKE:-}"
   fi
+  echo "${OS_ID}|${OS_LIKE}"
 }
 
-pm_detect() {
-  if have_cmd apt-get; then echo apt
-  elif have_cmd dnf; then echo dnf
-  elif have_cmd yum; then echo yum
-  elif have_cmd pacman; then echo pacman
-  else echo unknown
-  fi
-}
-
-pkg_install() {
-  local pm; pm="$(pm_detect)"
-  local pkgs=("$@")
-
-  case "$pm" in
-    apt)
-      export DEBIAN_FRONTEND=noninteractive
-      apt-get update -y
-      apt-get install -y "${pkgs[@]}"
-      ;;
-    dnf)
-      dnf install -y "${pkgs[@]}"
-      ;;
-    yum)
-      yum install -y "${pkgs[@]}"
-      ;;
-    pacman)
-      pacman -Sy --noconfirm "${pkgs[@]}"
-      ;;
-    *)
-      die "Unknown package manager. Please install manually: ${pkgs[*]}"
-      ;;
-  esac
-}
-
-rand_port() {
-  if have_cmd shuf; then
-    shuf -i 20000-60000 -n 1
-  elif have_cmd python3; then
-    python3 - <<'PY'
-import random
-print(random.randint(20000, 60000))
-PY
-  else
-    echo 34567
-  fi
-}
-
-is_port_valid() {
+is_port_in_use() {
   local p="$1"
-  [[ "$p" =~ ^[0-9]+$ ]] || return 1
-  (( p >= 1 && p <= 65535 )) || return 1
-  return 0
-}
-
-detect_ip() {
-  local ip=""
-  if have_cmd curl; then
-    ip="$(curl -fsSL https://api.ipify.org 2>/dev/null || true)"
-  fi
-  if [[ -z "$ip" ]] && have_cmd ip; then
-    ip="$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}' || true)"
-  fi
-  echo "${ip:-127.0.0.1}"
-}
-
-compose_cmd() {
-  if have_cmd docker && docker compose version >/dev/null 2>&1; then
-    echo "docker compose"
-  elif have_cmd docker-compose; then
-    echo "docker-compose"
+  if cmd_exists ss; then
+    ss -lntp 2>/dev/null | awk '{print $4}' | grep -Eq "(:|\\])${p}$"
+    return $?
+  elif cmd_exists netstat; then
+    netstat -lnt 2>/dev/null | awk '{print $4}' | grep -Eq "(:|\\])${p}$"
+    return $?
   else
-    return 1
+    # fallback: try bind check via bash /dev/tcp (not perfect)
+    (echo >/dev/tcp/127.0.0.1/"${p}") >/dev/null 2>&1 && return 0 || return 1
   fi
 }
 
-ensure_basics() {
-  info "Checking basic dependencies..."
-  local need=(curl)
-  for c in "${need[@]}"; do
-    if ! have_cmd "$c"; then
-      warn "Missing command: $c (will install)"
-      pkg_install curl ca-certificates
-      break
+get_public_ip() {
+  local ip=""
+  for u in \
+    "https://api.ipify.org" \
+    "https://ifconfig.me/ip" \
+    "https://icanhazip.com"
+  do
+    ip="$(curl -fsSL --max-time 5 "$u" 2>/dev/null || true)"
+    ip="${ip//$'\n'/}"
+    if [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+      echo "$ip"; return 0
     fi
   done
-
-  # Some distros don't have ip by default
-  if ! have_cmd ip; then
-    warn "Missing command: ip (will install iproute2/iproute)"
-    # best-effort
-    pkg_install iproute2 >/dev/null 2>&1 || pkg_install iproute >/dev/null 2>&1 || true
-  fi
-
-  ok "Basic dependencies ready."
+  echo "YOUR_SERVER_IP"
 }
 
-install_docker_if_needed() {
-  if have_cmd docker; then
-    ok "Docker found: $(docker --version 2>/dev/null || true)"
+install_pkg() {
+  # install packages by best effort
+  local pkgs=("$@")
+  local os; os="$(detect_os)"
+  local id="${os%%|*}"
+  local like="${os#*|}"
+
+  if cmd_exists apt-get; then
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -y
+    apt-get install -y "${pkgs[@]}"
+  elif cmd_exists dnf; then
+    dnf install -y "${pkgs[@]}"
+  elif cmd_exists yum; then
+    yum install -y "${pkgs[@]}"
+  elif cmd_exists apk; then
+    apk add --no-cache "${pkgs[@]}"
   else
-    warn "Docker not found. Installing Docker + Compose plugin..."
-
-    local pm; pm="$(pm_detect)"
-    if [[ "$pm" == "apt" ]]; then
-      pkg_install ca-certificates curl gnupg lsb-release
-
-      install -m 0755 -d /etc/apt/keyrings
-      local os; os="$(os_id)"
-      curl -fsSL "https://download.docker.com/linux/${os}/gpg" | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
-      chmod a+r /etc/apt/keyrings/docker.gpg
-
-      # shellcheck disable=SC1091
-      . /etc/os-release
-      echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/${ID} ${VERSION_CODENAME} stable" \
-        > /etc/apt/sources.list.d/docker.list
-
-      apt-get update -y
-      apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
-    else
-      # best-effort for non-apt (may be older)
-      pkg_install docker >/dev/null 2>&1 || true
-      pkg_install docker-compose >/dev/null 2>&1 || true
-    fi
-
-    have_cmd docker || die "Docker install failed. Please install Docker manually and rerun."
-    ok "Docker installed: $(docker --version 2>/dev/null || true)"
-
-    if have_cmd systemctl; then
-      systemctl enable --now docker >/dev/null 2>&1 || true
-    fi
+    die "无法识别包管理器，无法自动安装依赖：${pkgs[*]}"
   fi
-
-  if ! compose_cmd >/dev/null 2>&1; then
-    warn "Docker Compose not found. Trying to install compose plugin..."
-    local pm; pm="$(pm_detect)"
-    if [[ "$pm" == "apt" ]]; then
-      apt-get update -y
-      apt-get install -y docker-compose-plugin
-    else
-      pkg_install docker-compose >/dev/null 2>&1 || true
-    fi
-  fi
-
-  compose_cmd >/dev/null 2>&1 || die "Docker Compose is still missing."
-  ok "Compose ready: $($(compose_cmd) version 2>/dev/null | head -n 1 || true)"
 }
 
-# ---------- project ops ----------
-write_project_files() {
-  mkdir -p "$APP_DIR" "$KV_DATA_DIR" "$NGINX_DIR_LOCAL"
+ensure_base_deps() {
+  log "检测基础依赖..."
+  local missing=()
 
-  cat > "$ENV_FILE" <<EOF
-# Generated by decotv-onekey.sh
-USERNAME=${ADMIN_USER}
-PASSWORD=${ADMIN_PASS}
+  cmd_exists curl || missing+=("curl")
+  cmd_exists openssl || missing+=("openssl")
+  cmd_exists sed || missing+=("sed")
+  cmd_exists awk || missing+=("awk")
+  cmd_exists grep || missing+=("grep")
 
-# Storage (recommended)
-NEXT_PUBLIC_STORAGE_TYPE=kvrocks
-KVROCKS_URL=redis://decotv-kvrocks:6666
-EOF
+  # ss preferred
+  if ! cmd_exists ss && ! cmd_exists netstat; then
+    # ss usually in iproute2, netstat in net-tools
+    missing+=("iproute2")
+  fi
 
-  cat > "$COMPOSE_FILE" <<EOF
+  if ((${#missing[@]} > 0)); then
+    warn "缺少依赖：${missing[*]}，开始安装..."
+    install_pkg "${missing[@]}"
+  else
+    log "基础依赖齐全"
+  fi
+}
+
+ensure_docker() {
+  log "检测 Docker..."
+  if cmd_exists docker; then
+    log "Docker 已存在：$(docker --version 2>/dev/null || true)"
+  else
+    warn "未检测到 Docker，开始安装 Docker（官方脚本方式）..."
+    ensure_base_deps
+    curl -fsSL https://get.docker.com | sh
+    systemctl enable --now docker >/dev/null 2>&1 || true
+    log "Docker 安装完成：$(docker --version 2>/dev/null || true)"
+  fi
+
+  if ! systemctl is-active --quiet docker 2>/dev/null; then
+    warn "Docker 服务未处于 active，尝试启动..."
+    systemctl start docker || true
+  fi
+
+  docker info >/dev/null 2>&1 || die "Docker 无法正常工作，请检查 docker 服务状态。"
+}
+
+ensure_compose() {
+  log "检测 Docker Compose..."
+  if docker compose version >/dev/null 2>&1; then
+    log "Docker Compose 可用：$(docker compose version 2>/dev/null | head -n1)"
+    return 0
+  fi
+
+  # try docker-compose legacy
+  if cmd_exists docker-compose; then
+    log "docker-compose 可用：$(docker-compose --version 2>/dev/null || true)"
+    return 0
+  fi
+
+  warn "未检测到 compose 插件/命令，尝试安装 docker-compose-plugin..."
+  if cmd_exists apt-get; then
+    install_pkg docker-compose-plugin
+  elif cmd_exists dnf; then
+    install_pkg docker-compose-plugin
+  elif cmd_exists yum; then
+    install_pkg docker-compose-plugin
+  elif cmd_exists apk; then
+    # alpine: docker-cli-compose exists sometimes
+    install_pkg docker-cli-compose || true
+  fi
+
+  docker compose version >/dev/null 2>&1 || die "Docker Compose 安装失败，请手动安装 compose 插件后重试。"
+}
+
+compose_up() {
+  if docker compose version >/dev/null 2>&1; then
+    (cd "$APP_DIR" && docker compose -f "$COMPOSE_FILE" up -d)
+  else
+    (cd "$APP_DIR" && docker-compose -f "$COMPOSE_FILE" up -d)
+  fi
+}
+
+compose_down() {
+  if [[ -f "$COMPOSE_FILE" ]]; then
+    if docker compose version >/dev/null 2>&1; then
+      (cd "$APP_DIR" && docker compose -f "$COMPOSE_FILE" down)
+    else
+      (cd "$APP_DIR" && docker-compose -f "$COMPOSE_FILE" down)
+    fi
+  fi
+}
+
+compose_pull() {
+  if docker compose version >/dev/null 2>&1; then
+    (cd "$APP_DIR" && docker compose -f "$COMPOSE_FILE" pull)
+  else
+    (cd "$APP_DIR" && docker-compose -f "$COMPOSE_FILE" pull)
+  fi
+}
+
+write_compose() {
+  local host_port="$1"
+  mkdir -p "$APP_DIR"
+  cat >"$COMPOSE_FILE" <<EOF
 services:
   decotv-core:
-    image: ghcr.io/decohererk/decotv:${IMAGE_TAG}
+    image: ${IMAGE_CORE}
     container_name: decotv-core
     restart: on-failure
     ports:
-      - "${HOST_PORT}:3000"
+      - '${host_port}:${DEFAULT_APP_PORT}'
     env_file:
-      - .env
-    depends_on:
-      - decotv-kvrocks
+      - ./.env
+    environment:
+      - NEXT_PUBLIC_STORAGE_TYPE=kvrocks
+      - KVROCKS_URL=redis://decotv-kvrocks:6666
     networks:
       - decotv-network
+    depends_on:
+      - decotv-kvrocks
 
   decotv-kvrocks:
-    image: apache/kvrocks
+    image: ${IMAGE_KVROCKS}
     container_name: decotv-kvrocks
     restart: unless-stopped
     volumes:
-      - ./kvrocks-data:/var/lib/kvrocks
+      - kvrocks-data:/var/lib/kvrocks
     networks:
       - decotv-network
 
 networks:
   decotv-network:
     driver: bridge
+
+volumes:
+  kvrocks-data:
 EOF
-
-  ok "Wrote: ${ENV_FILE}"
-  ok "Wrote: ${COMPOSE_FILE}"
 }
 
-dc_up() {
-  local c; c="$(compose_cmd)"
-  (cd "$APP_DIR" && $c pull && $c up -d)
-}
-
-dc_down() {
-  local c; c="$(compose_cmd)"
-  (cd "$APP_DIR" && $c down)
-}
-
-dc_status() {
-  local c; c="$(compose_cmd)"
-  (cd "$APP_DIR" && $c ps)
-}
-
-dc_logs() {
-  local c; c="$(compose_cmd)"
-  (cd "$APP_DIR" && $c logs -n 200 --no-color)
-}
-
-nginx_generate_conf() {
-  local domain="$1"
-  local host_port="$2"
-
-  local local_path="${NGINX_DIR_LOCAL}/${NGINX_PREFIX}-${domain}.conf"
-  cat > "$local_path" <<EOF
-# DecoTV reverse proxy (generated)
-# Safe: This file is generated under ${APP_DIR}. You can copy it manually.
-
-server {
-  listen 80;
-  server_name ${domain};
-
-  location / {
-    proxy_pass http://127.0.0.1:${host_port};
-    proxy_http_version 1.1;
-    proxy_set_header Host \$host;
-    proxy_set_header X-Real-IP \$remote_addr;
-    proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-    proxy_set_header X-Forwarded-Proto \$scheme;
-  }
-}
-EOF
-  ok "Generated nginx snippet: ${local_path}"
-
-  if have_cmd nginx && [[ -d /etc/nginx/conf.d ]]; then
-    local sys_path="/etc/nginx/conf.d/${NGINX_PREFIX}-${domain}.conf"
-    cat > "$sys_path" <<EOF
-# DecoTV reverse proxy (generated by decotv-onekey.sh)
-# Safe: does NOT touch nginx.conf / default site; just adds this file.
-
-server {
-  listen 80;
-  server_name ${domain};
-
-  location / {
-    proxy_pass http://127.0.0.1:${host_port};
-    proxy_http_version 1.1;
-    proxy_set_header Host \$host;
-    proxy_set_header X-Real-IP \$remote_addr;
-    proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-    proxy_set_header X-Forwarded-Proto \$scheme;
-  }
-}
-EOF
-    ok "Also wrote: ${sys_path}"
-    warn "Nginx is NOT reloaded by this script. Run manually: nginx -t && systemctl reload nginx"
-  else
-    warn "nginx not detected (or /etc/nginx/conf.d missing). Snippet is generated; use your own reverse proxy."
-  fi
-}
-
-uninstall_project() {
-  banner
-  warn "This will remove ONLY DecoTV project directory and its containers."
-  read -r -p "Type 'YES' to confirm uninstall: " x
-  [[ "$x" == "YES" ]] || die "Cancelled."
-
-  if [[ -d "$APP_DIR" ]]; then
-    warn "Stopping containers (if running)..."
-    dc_down >/dev/null 2>&1 || true
-    rm -rf "$APP_DIR"
-    ok "Removed: ${APP_DIR}"
-  else
-    warn "Not installed: ${APP_DIR}"
-  fi
-
-  if [[ -d /etc/nginx/conf.d ]]; then
-    rm -f /etc/nginx/conf.d/${NGINX_PREFIX}-*.conf >/dev/null 2>&1 || true
-  fi
-  ok "Uninstall done. (Docker not removed)"
-}
-
-# ---------- interactive flow ----------
-prompt_install() {
-  banner
-
-  read -r -p "Admin username [admin]: " ADMIN_USER || true
-  ADMIN_USER="${ADMIN_USER:-admin}"
-
+prompt_nonempty() {
+  local prompt="$1"
+  local v=""
   while true; do
-    local p1 p2
-    read -r -s -p "Admin password (will be shown later): " p1 || true
-    echo
-    [[ -n "$p1" ]] || { warn "Password cannot be empty."; continue; }
-    read -r -s -p "Confirm password: " p2 || true
-    echo
-    if [[ "$p1" != "$p2" ]]; then
-      warn "Passwords do not match. Try again."
+    read -r -p "$prompt" v
+    v="${v//[$'\t\r\n ']/}"
+    if [[ -n "$v" ]]; then
+      echo "$v"; return 0
+    fi
+    warn "不能为空，请重试。"
+  done
+}
+
+prompt_password_confirm() {
+  local p1 p2
+  while true; do
+    read -r -s -p "请输入管理员密码: " p1; echo
+    read -r -s -p "请再次输入管理员密码: " p2; echo
+    if [[ -z "$p1" ]]; then
+      warn "密码不能为空。"
       continue
     fi
-    ADMIN_PASS="$p1"
-    break
-  done
-
-  read -r -p "Image tag [latest]: " IMAGE_TAG || true
-  IMAGE_TAG="${IMAGE_TAG:-latest}"
-
-  while true; do
-    read -r -p "Host port (1-65535, empty=random 20000-60000): " HOST_PORT || true
-    HOST_PORT="${HOST_PORT:-$(rand_port)}"
-    if is_port_valid "$HOST_PORT"; then
-      break
+    if [[ "$p1" != "$p2" ]]; then
+      warn "两次密码不一致，请重试。"
+      continue
     fi
-    warn "Invalid port: ${HOST_PORT}"
+    echo "$p1"
+    return 0
   done
-
-  read -r -p "Domain for reverse proxy (optional, empty=skip): " DOMAIN || true
-  DOMAIN="${DOMAIN:-}"
-
-  hr
-  printf "%bReview settings%b\n" "$C_BOLD" "$C_RESET"
-  printf "- Username : %s\n" "$ADMIN_USER"
-  printf "- Password : %s\n" "$ADMIN_PASS"
-  printf "- ImageTag : %s\n" "$IMAGE_TAG"
-  printf "- Port     : %s\n" "$HOST_PORT"
-  printf "- Domain   : %s\n" "${DOMAIN:-<none>}"
-  hr
-
-  read -r -p "Proceed with deploy? [y/N]: " yn
-  case "${yn:-}" in
-    y|Y|yes|YES) ;;
-    *) die "Cancelled." ;;
-  esac
 }
 
-print_access() {
-  local ip; ip="$(detect_ip)"
-  hr
-  printf "%bDeployed successfully%b\n" "$C_BOLD" "$C_RESET"
-  printf "Access URL : http://%s:%s\n" "$ip" "$HOST_PORT"
-  printf "Admin URL  : http://%s:%s/admin\n" "$ip" "$HOST_PORT"
-  printf "Username   : %s\n" "$ADMIN_USER"
-  printf "Password   : %s\n" "$ADMIN_PASS"
-  if [[ -n "${DOMAIN:-}" ]]; then
-    printf "Domain     : %s\n" "$DOMAIN"
+write_env() {
+  local user="$1"
+  local pass="$2"
+  local base_url="$3"
+  cat >"$ENV_FILE" <<EOF
+# DecoTV env
+USERNAME=${user}
+PASSWORD=${pass}
+SITE_BASE=${base_url}
+EOF
+  chmod 600 "$ENV_FILE"
+}
+
+ensure_nginx() {
+  if cmd_exists nginx; then
+    log "Nginx 已存在：$(nginx -v 2>&1 || true)"
+  else
+    warn "未检测到 Nginx，将安装（仅用于本项目反代，不覆盖其他站点）..."
+    install_pkg nginx
   fi
-  hr
-  warn "Reminder: DecoTV needs you to configure sources in the admin panel after first login."
+
+  mkdir -p "$NGINX_CONF_DIR"
+  systemctl enable --now nginx >/dev/null 2>&1 || true
+}
+
+write_nginx_conf() {
+  local domain="$1"
+  local proxy_port="$2"
+  local upstream_port="$3"
+
+  cat >"$NGINX_CONF_FILE" <<EOF
+# ${APP_NAME} reverse proxy (non-invasive)
+# Generated by DecoTV one-click script
+
+server {
+  listen ${proxy_port};
+  listen [::]:${proxy_port};
+
+  server_name ${domain};
+
+  client_max_body_size 64m;
+
+  location / {
+    proxy_pass http://127.0.0.1:${upstream_port};
+    proxy_http_version 1.1;
+
+    proxy_set_header Host \$host;
+    proxy_set_header X-Real-IP \$remote_addr;
+    proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto \$scheme;
+
+    proxy_set_header Upgrade \$http_upgrade;
+    proxy_set_header Connection "upgrade";
+  }
+}
+EOF
+
+  nginx -t || die "Nginx 配置测试失败，请检查：${NGINX_CONF_FILE}"
+  systemctl reload nginx || systemctl restart nginx
+}
+
+show_access() {
+  local user="$1"
+  local pass="$2"
+  local host_port="$3"
+  local domain="$4"
+  local proxy_port="$5"
+
+  local ip; ip="$(get_public_ip)"
+
+  echo
+  echo "=============================="
+  echo " DecoTV 部署完成"
+  echo "=============================="
+  echo "管理员账号: ${user}"
+  echo "管理员密码: ${pass}"
+  echo "应用端口  : ${host_port}"
+  echo
+
+  if [[ -n "$domain" ]]; then
+    echo "访问地址(域名): http://${domain}:${proxy_port}"
+    if [[ "$proxy_port" == "80" ]]; then
+      echo "访问地址(域名): http://${domain}"
+    fi
+  else
+    echo "访问地址(IP):   http://${ip}:${host_port}"
+  fi
+  echo "安装目录: ${APP_DIR}"
+  echo
 }
 
 install_flow() {
-  need_root
-  ensure_basics
-  install_docker_if_needed
-  prompt_install
+  ensure_base_deps
+  ensure_docker
+  ensure_compose
 
-  info "Writing project files..."
-  write_project_files
+  mkdir -p "$APP_DIR"
 
-  info "Starting containers..."
-  dc_up
+  local host_port="${DEFAULT_HOST_PORT}"
+  read -r -p "请输入 DecoTV 对外端口(默认 ${DEFAULT_HOST_PORT}): " host_port
+  host_port="${host_port:-$DEFAULT_HOST_PORT}"
 
-  ok "Containers started."
-  dc_status || true
-
-  if [[ -n "${DOMAIN:-}" ]]; then
-    info "Generating nginx reverse-proxy config (optional)..."
-    nginx_generate_conf "$DOMAIN" "$HOST_PORT" || true
+  if ! [[ "$host_port" =~ ^[0-9]+$ ]] || ((host_port<1 || host_port>65535)); then
+    die "端口不合法：$host_port"
   fi
 
-  print_access
+  if is_port_in_use "$host_port"; then
+    die "端口 ${host_port} 已被占用，请换一个端口后重试。"
+  fi
+
+  local admin_user
+  admin_user="$(prompt_nonempty "请输入管理员用户名: ")"
+
+  local admin_pass
+  admin_pass="$(prompt_password_confirm)"
+
+  local domain=""
+  read -r -p "如需启用 Nginx 反代，请输入绑定域名(留空则不启用反代): " domain
+  domain="${domain//[$'\t\r\n ']/}"
+
+  write_compose "$host_port"
+
+  local base_url=""
+  if [[ -n "$domain" ]]; then
+    # base_url depends on proxy port result; fill later
+    base_url="http://${domain}"
+  else
+    base_url=""
+  fi
+  write_env "$admin_user" "$admin_pass" "$base_url"
+
+  log "启动容器..."
+  compose_up
+  log "容器已启动"
+
+  local proxy_port=""
+  if [[ -n "$domain" ]]; then
+    ensure_nginx
+
+    proxy_port="$DEFAULT_PROXY_HTTP_PORT"
+    if is_port_in_use "$DEFAULT_PROXY_HTTP_PORT"; then
+      warn "检测到 80 端口已被占用（可能是其他面板/服务），为避免冲突，本项目反代改用 ${FALLBACK_PROXY_HTTP_PORT}。"
+      proxy_port="$FALLBACK_PROXY_HTTP_PORT"
+      if is_port_in_use "$proxy_port"; then
+        warn "端口 ${proxy_port} 也被占用，将跳过反代配置，仅保留 Docker 端口访问。"
+        domain=""
+        proxy_port=""
+      fi
+    fi
+
+    if [[ -n "$domain" && -n "$proxy_port" ]]; then
+      write_nginx_conf "$domain" "$proxy_port" "$host_port"
+      # update SITE_BASE now
+      sed -i "s#^SITE_BASE=.*#SITE_BASE=http://${domain}:${proxy_port}#g" "$ENV_FILE" || true
+      if [[ "$proxy_port" == "80" ]]; then
+        sed -i "s#^SITE_BASE=.*#SITE_BASE=http://${domain}#g" "$ENV_FILE" || true
+      fi
+      # apply env change
+      compose_up
+      log "Nginx 反代已生效：${NGINX_CONF_FILE}"
+    fi
+  fi
+
+  show_access "$admin_user" "$admin_pass" "$host_port" "$domain" "${proxy_port:-$DEFAULT_HOST_PORT}"
 }
 
-show_help() {
-  cat <<EOF
-DecoTV One-key Deploy
+update_image_flow() {
+  [[ -d "$APP_DIR" && -f "$COMPOSE_FILE" ]] || die "未检测到安装目录：${APP_DIR}，请先安装。"
+  ensure_docker
+  ensure_compose
+  log "拉取最新镜像并重建容器..."
+  compose_pull
+  compose_up
+  log "更新完成（已拉取 latest 并重建）"
+}
 
-Usage:
-  bash $0                install/update & start
-  bash $0 install         same as above
-  bash $0 status          show status
-  bash $0 logs            show last 200 logs
-  bash $0 restart         restart service
-  bash $0 stop            stop service
-  bash $0 uninstall       uninstall ONLY this project
+status_flow() {
+  ensure_docker
+  echo
+  docker ps --format "table {{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}" | sed -n '1p;/decotv/p' || true
+  echo
+  if [[ -f "$NGINX_CONF_FILE" ]]; then
+    log "检测到 Nginx 配置：${NGINX_CONF_FILE}"
+  fi
+  echo
+}
+
+uninstall_flow() {
+  warn "将停止并移除本项目容器，但不会删除你的 Docker，也不会动其他服务。"
+  read -r -p "确认卸载 DecoTV？(y/N): " yn
+  yn="${yn:-N}"
+  if [[ "$yn" != "y" && "$yn" != "Y" ]]; then
+    log "已取消"
+    return 0
+  fi
+
+  compose_down || true
+
+  if [[ -f "$NGINX_CONF_FILE" ]]; then
+    rm -f "$NGINX_CONF_FILE"
+    nginx -t >/dev/null 2>&1 && (systemctl reload nginx || true) || true
+    log "已移除 Nginx 本项目配置：${NGINX_CONF_FILE}"
+  fi
+
+  rm -rf "$APP_DIR"
+  log "已卸载完成：${APP_DIR}"
+}
+
+menu() {
+  cat <<'EOF'
+==============================
+ DecoTV · One-Click Deploy
+==============================
+1) 安装 / 重装（含依赖检测、可选反代）
+2) 更新镜像（pull latest + 重建容器）
+3) 状态查看
+4) 卸载（仅移除本项目）
+0) 退出
 EOF
+  read -r -p "请选择: " choice
+  case "${choice:-}" in
+    1) install_flow ;;
+    2) update_image_flow ;;
+    3) status_flow ;;
+    4) uninstall_flow ;;
+    0) exit 0 ;;
+    *) warn "无效选择";;
+  esac
 }
 
 main() {
-  local cmd="${1:-install}"
-  case "$cmd" in
-    install|"")
-      install_flow
-      ;;
-    status)
-      need_root
-      [[ -d "$APP_DIR" ]] || die "Not installed: ${APP_DIR}"
-      dc_status
-      ;;
-    logs)
-      need_root
-      [[ -d "$APP_DIR" ]] || die "Not installed: ${APP_DIR}"
-      dc_logs
-      ;;
-    restart)
-      need_root
-      [[ -d "$APP_DIR" ]] || die "Not installed: ${APP_DIR}"
-      dc_down || true
-      dc_up
-      dc_status || true
-      ;;
-    stop|down)
-      need_root
-      [[ -d "$APP_DIR" ]] || die "Not installed: ${APP_DIR}"
-      dc_down
-      ok "Stopped."
-      ;;
-    uninstall|remove)
-      need_root
-      uninstall_project
-      ;;
-    help|-h|--help)
-      show_help
-      ;;
-    *)
-      show_help
-      die "Unknown command: $cmd"
-      ;;
-  esac
+  need_root
+  menu
 }
 
 main "$@"
