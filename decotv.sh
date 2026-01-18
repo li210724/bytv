@@ -1,183 +1,177 @@
 #!/usr/bin/env bash
 set -e
 
-# ========== 基础配置 ==========
-APP_NAME="DecoTV"
-BASE_DIR="/opt/decotv"
-NETWORK="decotv-net"
-COMPOSE_FILE="${BASE_DIR}/docker-compose.yml"
-CADDY_FILE="${BASE_DIR}/Caddyfile"
+APP="DecoTV v3"
+BASE="/opt/decotv"
+NET="decotv-net"
+COMPOSE="$BASE/docker-compose.yml"
+NGINX_CONF="/etc/nginx/conf.d/decotv.conf"
 
-# ========== 工具函数 ==========
-pause() {
-  read -rp "按 Enter 继续..."
+need_root() {
+  [[ $EUID -ne 0 ]] && echo "请用 root 运行" && exit 1
 }
 
-get_ip() {
-  curl -s ipv4.icanhazip.com
-}
+pause() { read -rp "按 Enter 继续..."; }
 
-domain_ip() {
-  dig +short "$1" | tail -n1
-}
+has() { command -v "$1" &>/dev/null; }
 
-check_domain() {
-  local domain="$1"
-  local local_ip
-  local domain_ip_res
-
-  local_ip=$(get_ip)
-  domain_ip_res=$(domain_ip "$domain")
-
-  echo "🌐 本机 IP:     $local_ip"
-  echo "🌐 域名解析 IP: $domain_ip_res"
-
-  if [[ "$local_ip" != "$domain_ip_res" ]]; then
-    echo "❌ 域名未正确解析到本机"
-    return 1
-  fi
-  echo "✅ 域名解析正确"
-}
-
-install_docker() {
-  if ! command -v docker &>/dev/null; then
-    echo "[+] 安装 Docker"
+install_base() {
+  if ! has docker; then
     curl -fsSL https://get.docker.com | bash
     systemctl enable docker --now
   fi
-
-  if ! command -v docker-compose &>/dev/null; then
-    echo "[+] 安装 docker-compose"
+  if ! has docker-compose; then
     curl -L https://github.com/docker/compose/releases/download/v2.25.0/docker-compose-$(uname -s)-$(uname -m) \
       -o /usr/local/bin/docker-compose
     chmod +x /usr/local/bin/docker-compose
   fi
+  apt install -y jq dnsutils >/dev/null 2>&1
 }
 
-# ========== 部署 ==========
+# ---------------- Cloudflare DNS ----------------
+cf_ip() { curl -s ipv4.icanhazip.com; }
+
+cf_api() {
+  curl -s -X "$1" "https://api.cloudflare.com/client/v4$2" \
+    -H "Authorization: Bearer $CF_TOKEN" \
+    -H "Content-Type: application/json" \
+    --data "$3"
+}
+
+cf_sync() {
+  IP=$(cf_ip)
+  ZONE_ID=$(cf_api GET "/zones?name=$CF_ZONE" | jq -r '.result[0].id')
+  [[ "$ZONE_ID" == "null" ]] && echo "❌ CF Zone 不存在" && exit 1
+
+  RID=$(cf_api GET "/zones/$ZONE_ID/dns_records?type=A&name=$DOMAIN" | jq -r '.result[0].id')
+
+  DATA="{\"type\":\"A\",\"name\":\"$DOMAIN\",\"content\":\"$IP\",\"ttl\":120,\"proxied\":false}"
+
+  if [[ "$RID" == "null" ]]; then
+    echo "➕ 创建 DNS 记录"
+    cf_api POST "/zones/$ZONE_ID/dns_records" "$DATA" >/dev/null
+  else
+    echo "♻️ 更新 DNS 记录"
+    cf_api PUT "/zones/$ZONE_ID/dns_records/$RID" "$DATA" >/dev/null
+  fi
+
+  sleep 5
+  [[ "$(dig +short $DOMAIN | tail -n1)" != "$IP" ]] && echo "❌ DNS 校验失败" && exit 1
+  echo "✅ Cloudflare 解析完成"
+}
+
+# ---------------- Deploy ----------------
 deploy() {
-  read -rp "绑定域名 (如 tv.example.com): " DOMAIN
-  read -rp "证书邮箱: " EMAIL
-  read -rp "管理员账号: " ADMIN_USER
-  read -rp "管理员密码: " ADMIN_PASS
+  read -rp "域名 (tv.example.com): " DOMAIN
+  read -rp "管理员账号: " USER
+  read -rp "管理员密码: " PASS
 
-  check_domain "$DOMAIN" || return
+  read -rp "启用 Cloudflare 自动解析？(y/n): " CF
+  if [[ "$CF" == "y" ]]; then
+    read -rp "CF 主域名(example.com): " CF_ZONE
+    read -rp "CF API Token: " CF_TOKEN
+    cf_sync
+  fi
 
-  install_docker
+  install_base
 
-  mkdir -p "$BASE_DIR"
-  docker network inspect "$NETWORK" &>/dev/null || docker network create "$NETWORK"
+  mkdir -p "$BASE"
+  docker network inspect "$NET" &>/dev/null || docker network create "$NET"
 
-  cat >"$CADDY_FILE" <<EOF
-$DOMAIN {
-  encode gzip
-  reverse_proxy decotv:3000
-  tls $EMAIL
-}
-EOF
-
-  cat >"$COMPOSE_FILE" <<EOF
+  cat >"$COMPOSE" <<EOF
 version: "3.9"
 services:
   decotv:
     image: ghcr.io/decohererk/decotv:latest
+    container_name: decotv-app
     restart: unless-stopped
-    container_name: decotv
     environment:
-      - USERNAME=$ADMIN_USER
-      - PASSWORD=$ADMIN_PASS
+      - USERNAME=$USER
+      - PASSWORD=$PASS
       - NEXT_PUBLIC_STORAGE_TYPE=kvrocks
-      - KVROCKS_URL=redis://kvrocks:6666
-    networks:
-      - $NETWORK
+      - KVROCKS_URL=redis://decotv-kv:6666
+    ports:
+      - "127.0.0.1:3000:3000"
+    networks: [$NET]
 
   kvrocks:
     image: apache/kvrocks
+    container_name: decotv-kv
     restart: unless-stopped
-    container_name: kvrocks
     volumes:
-      - kvrocks-data:/var/lib/kvrocks
-    networks:
-      - $NETWORK
-
-  caddy:
-    image: caddy:2
-    restart: unless-stopped
-    container_name: decotv-caddy
-    ports:
-      - "80:80"
-      - "443:443"
-    volumes:
-      - ./Caddyfile:/etc/caddy/Caddyfile
-      - caddy-data:/data
-      - caddy-config:/config
-    networks:
-      - $NETWORK
+      - kv-data:/var/lib/kvrocks
+    networks: [$NET]
 
 volumes:
-  kvrocks-data:
-  caddy-data:
-  caddy-config:
+  kv-data:
 
 networks:
-  $NETWORK:
+  $NET:
     external: true
 EOF
 
-  cd "$BASE_DIR"
-  docker-compose up -d
+  docker-compose -f "$COMPOSE" up -d
 
-  echo "🎉 部署完成：https://$DOMAIN"
+  cat >"$NGINX_CONF" <<EOF
+server {
+  listen 80;
+  server_name $DOMAIN;
+
+  location / {
+    proxy_pass http://127.0.0.1:3000;
+    proxy_set_header Host \$host;
+    proxy_set_header X-Real-IP \$remote_addr;
+    proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+  }
+}
+EOF
+
+  nginx -t && systemctl reload nginx
+  echo "🎉 部署完成：http://$DOMAIN"
 }
 
-# ========== 更新 ==========
 update_app() {
-  cd "$BASE_DIR"
-  docker-compose pull
-  docker-compose up -d
-  echo "✅ 镜像已更新"
+  docker-compose -f "$COMPOSE" pull
+  docker-compose -f "$COMPOSE" up -d
+  echo "✅ 更新完成"
 }
 
-# ========== 卸载 ==========
-uninstall_app() {
-  read -rp "⚠️ 确认卸载（yes/no）: " CONFIRM
-  [[ "$CONFIRM" != "yes" ]] && return
-
-  docker-compose down -v || true
-  docker network rm "$NETWORK" || true
-  rm -rf "$BASE_DIR"
-  echo "🗑️ 已完全卸载"
+uninstall() {
+  read -rp "确认卸载 DecoTV？(yes): " OK
+  [[ "$OK" != "yes" ]] && return
+  docker-compose -f "$COMPOSE" down -v || true
+  docker network rm "$NET" 2>/dev/null || true
+  rm -rf "$BASE"
+  rm -f "$NGINX_CONF"
+  nginx -t && systemctl reload nginx
+  echo "🗑️ 已卸载（原系统无影响）"
 }
 
-# ========== 快捷指令 ==========
 install_cli() {
   cp "$0" /usr/local/bin/decotv
   chmod +x /usr/local/bin/decotv
-  echo "✅ 快捷命令已创建：decotv"
+  echo "✅ 已安装快捷命令：decotv"
 }
 
-# ========== 菜单 ==========
+need_root
 while true; do
   clear
-  echo "========== $APP_NAME 管理面板 =========="
-  echo "1️⃣  一键部署"
-  echo "2️⃣  更新镜像"
-  echo "3️⃣  停止服务"
-  echo "4️⃣  启动服务"
-  echo "5️⃣  卸载"
-  echo "6️⃣  创建快捷指令"
-  echo "0️⃣  退出"
-  echo "======================================="
-  read -rp "请选择: " CHOICE
-
-  case "$CHOICE" in
+  echo "==== $APP 管理面板 ===="
+  echo "1. 一键部署（零冲突）"
+  echo "2. 更新镜像"
+  echo "3. 启动服务"
+  echo "4. 停止服务"
+  echo "5. 卸载"
+  echo "6. 安装快捷命令"
+  echo "0. 退出"
+  read -rp "选择: " C
+  case $C in
     1) deploy; pause ;;
     2) update_app; pause ;;
-    3) docker-compose -f "$COMPOSE_FILE" down; pause ;;
-    4) docker-compose -f "$COMPOSE_FILE" up -d; pause ;;
-    5) uninstall_app; pause ;;
+    3) docker-compose -f "$COMPOSE" up -d; pause ;;
+    4) docker-compose -f "$COMPOSE" down; pause ;;
+    5) uninstall; pause ;;
     6) install_cli; pause ;;
-    0) exit 0 ;;
-    *) echo "无效选择"; pause ;;
+    0) exit ;;
   esac
 done
